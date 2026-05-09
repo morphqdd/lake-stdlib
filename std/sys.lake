@@ -1,0 +1,5 @@
+@rt(rt_exit)
+
+pub exit is {
+  code i64 -> { rt_exit(code) }
+}

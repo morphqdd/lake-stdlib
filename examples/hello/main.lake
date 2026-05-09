@@ -1,0 +1,12 @@
++std.io.{ println }
++std.math.{ abs }
+
+@rt(to_string_with_ln)
+
+main is {
+  _ -> {
+    let r = abs(-42)
+    let s = to_string_with_ln(r)
+    println(s)
+  }
+}

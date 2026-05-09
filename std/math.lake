@@ -1,0 +1,36 @@
+// Pure-compute helpers, all expressed as ret-typed actors so callers
+// can write `let r = abs(-5)` and get the value back synchronously
+// (under the hood: spawn + selective receive on the spawned pid).
+
+pub abs is {
+  n i64 -> ret i64 {
+    when 0 <= n {
+      true -> { ret n }
+      _    -> { ret -n }
+    }
+  }
+}
+
+pub mod is {
+  n i64 m i64 -> ret i64 {
+    ret n - n / m * m
+  }
+}
+
+pub min is {
+  a i64 b i64 -> ret i64 {
+    when a <= b {
+      true -> { ret a }
+      _    -> { ret b }
+    }
+  }
+}
+
+pub max is {
+  a i64 b i64 -> ret i64 {
+    when b <= a {
+      true -> { ret a }
+      _    -> { ret b }
+    }
+  }
+}
