@@ -22,6 +22,42 @@ underlying `rt_accept_async` parks a direct caller.  The wrapper costs
 one extra mailbox roundtrip; for tight per-byte loops bypass the
 stdlib and call `rt_*` directly.
 
+## Output ordering
+
+`std.io` machines (`print`, `println`, `eprint`, `eprintln`) are all
+ret-typed.  This gives you a per-call choice:
+
+```lake
+println("a")       // async — fire-and-forget; output order is
+println("b")       // whatever the scheduler picks
+println("c")
+//
+// $ ./prog
+// c
+// b
+// a   ← typical: scheduler runs in LIFO order
+```
+
+```lake
+pin println("a")   // sync — block until the wrapper actor
+pin println("b")   // finishes its rt_write and replies
+pin println("c")
+//
+// $ ./prog
+// a
+// b
+// c   ← guaranteed
+```
+
+`pin <expr>` is sugar for `let __pin_<id> = <expr>`: it forces the
+ret-machine sync return path and discards the value.  Use `let r = M(args)`
+when you want to capture the returned value.
+
+The `pin` form costs one mailbox roundtrip (~µs on the current
+scheduler) per call.  Programs that want guaranteed sequential output
+in a hot loop should bypass the stdlib and call `rt_write` directly —
+it's a blocking syscall, no actor involved.
+
 ## Installation
 
 There is no package manager yet.  Two ways to expose this library to

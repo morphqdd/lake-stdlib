@@ -1,12 +1,13 @@
 +std.io.{ println }
 +std.math.{ abs }
 
-@rt(to_string_with_ln)
+@rt(to_string)
 
 main is {
   _ -> {
+    pin println("lake-stdlib demo")
     let r = abs(-42)
-    let s = to_string_with_ln(r)
-    println(s)
+    let s = to_string(r)
+    pin println(s)
   }
 }

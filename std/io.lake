@@ -1,24 +1,52 @@
+// All I/O machines are ret-typed.  By default a bare call is async
+// (fire-and-forget — the implicit caller pid is the null sentinel
+// `0`, which `send_expr` silently drops):
+//
+//     println("hello")        // returns immediately, output
+//                             // ordering is whatever the
+//                             // scheduler picks
+//
+// To force sequential output use `pin`:
+//
+//     pin println("first")
+//     pin println("second")   // "first" appears before "second"
+//
+// `pin <expr>` is sugar for `let __pin_<id> = <expr>` — same
+// machinery, just no useless binding.  Use `let r = …` instead
+// when you want to capture the returned value.
+//
+// The sync path costs one mailbox roundtrip per call (~µs on the
+// current scheduler); the async path is the cheap default.
+
 @rt(rt_write)
 @rt(len)
 
 pub print is {
-  s str -> { rt_write(1 s len(s)) }
+  s str -> ret i64 {
+    rt_write(1 s len(s))
+    ret 0
+  }
 }
 
 pub println is {
-  s str -> {
+  s str -> ret i64 {
     rt_write(1 s len(s))
     rt_write(1 "\n" 1)
+    ret 0
   }
 }
 
 pub eprint is {
-  s str -> { rt_write(2 s len(s)) }
+  s str -> ret i64 {
+    rt_write(2 s len(s))
+    ret 0
+  }
 }
 
 pub eprintln is {
-  s str -> {
+  s str -> ret i64 {
     rt_write(2 s len(s))
     rt_write(2 "\n" 1)
+    ret 0
   }
 }
