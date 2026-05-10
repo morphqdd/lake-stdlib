@@ -1,0 +1,54 @@
+// String building helpers.  Each `concat*` allocates a fresh
+// fat-ptr buffer and copies the source bytes via `rt_copy_bytes`,
+// the bounds-checked memcpy primitive shipped with the compiler.
+// Returned value is a fat-ptr (i64 at the ABI level) pointing at the
+// concatenated payload — same shape as a `str` literal, so it can
+// be passed straight to `rt_write`, `rt_send_async`, `len`, etc.
+//
+// All wrappers are `ret`-typed so they compose with `let` and `pin`.
+//
+// For a slower but rt_copy_bytes-free implementation see
+// `std/experimental/strings.lake`.
+
+@rt(rt_allocate)
+@rt(rt_copy_bytes)
+@rt(len)
+
+// Concatenate two strings.  Result length = len(a) + len(b).
+pub concat is {
+  a str b str -> ret i64 {
+    let la = len(a)
+    let lb = len(b)
+    let total = la + lb
+    let dst = rt_allocate(total)
+    rt_copy_bytes(dst 0 a 0 la)
+    rt_copy_bytes(dst la b 0 lb)
+    ret dst
+  }
+}
+
+// Three-way concat — common for `header + ": " + value` shapes.
+pub concat3 is {
+  a str b str c str -> ret i64 {
+    let la = len(a)
+    let lb = len(b)
+    let lc = len(c)
+    let total = la + lb + lc
+    let dst = rt_allocate(total)
+    rt_copy_bytes(dst 0       a 0 la)
+    rt_copy_bytes(dst la      b 0 lb)
+    rt_copy_bytes(dst la + lb c 0 lc)
+    ret dst
+  }
+}
+
+// Slice of `s` starting at `off` of length `n`.  Returns a fresh
+// allocation; the source bytes are copied so the slice survives any
+// later free of `s`.
+pub slice is {
+  s str off i64 n i64 -> ret i64 {
+    let dst = rt_allocate(n)
+    rt_copy_bytes(dst 0 s off n)
+    ret dst
+  }
+}
