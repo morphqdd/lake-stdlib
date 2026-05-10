@@ -1,0 +1,4 @@
+# Compiled binaries from `lakec ... -r`
+build/
+**/build/
+*.o
