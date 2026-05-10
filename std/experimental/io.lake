@@ -1,0 +1,50 @@
+// Direct-syscall I/O for stdout / stderr.  Each machine maps to
+// exactly one `write(2)` syscall — no bounds checks, no fat-ptr
+// indirection through `rt_write`, no scheduler hand-off through
+// io_uring.
+//
+// All four wrappers are ret-typed so the existing `pin` keyword
+// can sequence them when output ordering matters.  The fast path
+// is plain async fire-and-forget:
+//
+//     +std.experimental.io.{ println }
+//     main is { _ -> { println("hi") } }
+//
+// Equivalent to the regular `std.io` shape — but it goes straight
+// to the kernel without any intermediate runtime helper.
+
++std.experimental.sys.{ SYS_WRITE FD_STDOUT FD_STDERR }
+
+@rt(rt_syscall)
+@rt(rt_str_ptr)
+@rt(len)
+
+pub print is {
+  s str -> ret i64 {
+    rt_syscall(SYS_WRITE FD_STDOUT rt_str_ptr(s) len(s) 0 0 0)
+    ret 0
+  }
+}
+
+pub println is {
+  s str -> ret i64 {
+    rt_syscall(SYS_WRITE FD_STDOUT rt_str_ptr(s) len(s) 0 0 0)
+    rt_syscall(SYS_WRITE FD_STDOUT rt_str_ptr("\n") 1 0 0 0)
+    ret 0
+  }
+}
+
+pub eprint is {
+  s str -> ret i64 {
+    rt_syscall(SYS_WRITE FD_STDERR rt_str_ptr(s) len(s) 0 0 0)
+    ret 0
+  }
+}
+
+pub eprintln is {
+  s str -> ret i64 {
+    rt_syscall(SYS_WRITE FD_STDERR rt_str_ptr(s) len(s) 0 0 0)
+    rt_syscall(SYS_WRITE FD_STDERR rt_str_ptr("\n") 1 0 0 0)
+    ret 0
+  }
+}

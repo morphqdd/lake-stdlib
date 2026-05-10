@@ -1,0 +1,11 @@
++std.experimental.io.{ println }
++std.experimental.sys.{ exit }
+
+main is {
+  _ -> {
+    pin println("hello from raw syscalls")
+    pin println("no rt_write, no fat-ptr indirection")
+    pin println("just write(2) directly")
+    exit(0)
+  }
+}

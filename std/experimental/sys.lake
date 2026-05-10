@@ -1,0 +1,51 @@
+// Linux x86_64 syscall numbers and the thinnest possible wrappers
+// over the raw `rt_syscall` runtime primitive.  Use this module when
+// you want direct kernel-call control without the bounds-checked
+// helpers (`rt_write`, `rt_recv_async`, …) shipped with the
+// compiler.
+//
+// Trade-off: zero abstraction overhead, but also zero safety net.
+// `rt_syscall` is unbounded — passing a stale buffer pointer or the
+// wrong length will crash or silently corrupt memory.  See
+// `experimental/README.md` for the boundary between this module and
+// the regular stdlib I/O.
+
+@rt(rt_syscall)
+
+// ── Linux x86_64 syscall numbers ────────────────────────────────
+//
+// Source: arch/x86/entry/syscalls/syscall_64.tbl in the Linux tree.
+// We expose only the ones that the experimental stdlib uses today;
+// adding more is a one-line edit.
+pub const SYS_READ      = 0
+pub const SYS_WRITE     = 1
+pub const SYS_OPEN      = 2
+pub const SYS_CLOSE     = 3
+pub const SYS_LSEEK     = 8
+pub const SYS_MMAP      = 9
+pub const SYS_BRK       = 12
+pub const SYS_GETPID    = 39
+pub const SYS_EXIT      = 60
+
+// File descriptors that ship with every process.
+pub const FD_STDIN      = 0
+pub const FD_STDOUT     = 1
+pub const FD_STDERR     = 2
+
+// ── thin wrappers ───────────────────────────────────────────────
+
+// Terminate the current process with `code`.  Returns nothing
+// because the kernel never returns from `exit`.
+pub exit is {
+  code i64 -> {
+    rt_syscall(SYS_EXIT code 0 0 0 0 0)
+  }
+}
+
+// Return the kernel-assigned pid of the current process.  Useful
+// for debug logging; not the same as Lake's actor pid.
+pub getpid is {
+  _ -> ret i64 {
+    ret rt_syscall(SYS_GETPID 0 0 0 0 0 0)
+  }
+}
