@@ -1,0 +1,109 @@
+// Bounded byte-level access on top of the compiler-shipped
+// `rt_load_u*` / `rt_store` primitives.  Every wrapper compiles to
+// one rt-call at the IR level — this module exists for naming and
+// for composing higher-level helpers (`be32`, `set_be32`).
+//
+// The buffer arg is always a fat-pointer (`rt_allocate` return
+// value or a `str` literal — Lake collapses both to i64 at the
+// runtime ABI).  Loads / stores are bounded; an out-of-range
+// offset traps via the rt-fn's bounds check.
+//
+// For tight inner loops where a function call per byte hurts,
+// reach for the indexing operator (`buf[i]`) once it lands —
+// see task B4.
+
+@rt(rt_load_u8)
+@rt(rt_load_u16)
+@rt(rt_load_u32)
+@rt(rt_load_u64)
+@rt(rt_store)
+
+// ── byte loads ─────────────────────────────────────────────────
+
+// Read one byte from `buf` at `off`, returned as i64.
+pub at is {
+  buf i64 off i64 -> ret i64 {
+    ret rt_load_u8(buf off)
+  }
+}
+
+// 16-bit little-endian read.
+pub at16 is {
+  buf i64 off i64 -> ret i64 {
+    ret rt_load_u16(buf off)
+  }
+}
+
+// 32-bit little-endian read.
+pub at32 is {
+  buf i64 off i64 -> ret i64 {
+    ret rt_load_u32(buf off)
+  }
+}
+
+// 64-bit little-endian read.
+pub at64 is {
+  buf i64 off i64 -> ret i64 {
+    ret rt_load_u64(buf off)
+  }
+}
+
+// ── byte stores ────────────────────────────────────────────────
+
+// Write a single byte (`val & 0xff`) into `buf` at `off`.
+pub set is {
+  buf i64 off i64 val i64 -> ret i64 {
+    rt_store(buf val 1 off)
+    ret 0
+  }
+}
+
+// Write a 16-bit value, little-endian.
+pub set16 is {
+  buf i64 off i64 val i64 -> ret i64 {
+    rt_store(buf val 2 off)
+    ret 0
+  }
+}
+
+// Write a 32-bit value, little-endian.
+pub set32 is {
+  buf i64 off i64 val i64 -> ret i64 {
+    rt_store(buf val 4 off)
+    ret 0
+  }
+}
+
+// Write a 64-bit value, little-endian.
+pub set64 is {
+  buf i64 off i64 val i64 -> ret i64 {
+    rt_store(buf val 8 off)
+    ret 0
+  }
+}
+
+// ── big-endian helpers ─────────────────────────────────────────
+
+// Read a 32-bit big-endian word — what crypto / network protocols
+// use.  Composed from four byte loads + shifts so we don't depend
+// on a dedicated rt-fn.
+pub be32 is {
+  buf i64 off i64 -> ret i64 {
+    let b0 = rt_load_u8(buf off)
+    let b1 = rt_load_u8(buf off + 1)
+    let b2 = rt_load_u8(buf off + 2)
+    let b3 = rt_load_u8(buf off + 3)
+    ret b0 << 24 | b1 << 16 | b2 << 8 | b3
+  }
+}
+
+// Write a 32-bit big-endian word.
+pub set_be32 is {
+  buf i64 off i64 val i64 -> ret i64 {
+    rt_store(buf val >> 24 & 0xff 1 off)
+    rt_store(buf val >> 16 & 0xff 1 off + 1)
+    rt_store(buf val >> 8  & 0xff 1 off + 2)
+    rt_store(buf val       & 0xff 1 off + 3)
+    ret 0
+  }
+}
