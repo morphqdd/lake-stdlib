@@ -1,0 +1,66 @@
+// TCP server primitives, thin wrappers over the rt async-I/O surface.
+//
+// Every wrapper here is a Lake actor.  Calling `let conn = accept(srv)`
+// therefore spawns a small wrapper actor that parks on the rt syscall,
+// then sends the result back via the standard sync-return protocol —
+// one extra mailbox roundtrip on top of the rt call itself.  Accept
+// already syscalls, so the overhead is in the noise; for a hot send
+// loop (many small writes per connection) bypass the stdlib and call
+// `rt_send_async` / `rt_close` directly.
+
+@rt(rt_listen_tcp)
+@rt(rt_accept_async)
+@rt(rt_send_async)
+@rt(rt_recv_async)
+@rt(rt_close)
+@rt(len)
+
+/// Open a listening TCP socket bound to `port` on 0.0.0.0.  Returns the
+/// raw socket fd as an i64; pass it to `accept` to take connections.
+pub listen is {
+  port i64 -> ret i64 {
+    ret rt_listen_tcp(port)
+  }
+}
+
+/// Accept the next pending connection on `srv` and return its fd.  The
+/// wrapper actor parks until the underlying io_uring accept completes,
+/// so the caller — through the sync-return desugar — also blocks.
+pub accept is {
+  srv i64 -> ret i64 {
+    ret rt_accept_async(srv)
+  }
+}
+
+/// Send `s` over `conn`.  Length is computed from the string's fat
+/// pointer so the caller doesn't repeat it.  This is a synchronous
+/// return so a follow-up `close(conn)` can rely on the bytes having
+/// been queued before the descriptor is freed.
+pub send is {
+  conn i64 s str -> ret i64 {
+    rt_send_async(conn s len(s))
+    ret 0
+  }
+}
+
+/// Read up to `size` bytes from `conn` into `buf` (an i64 fat-pointer
+/// address obtained from `rt_allocate`).  Returns the number of bytes
+/// actually read; 0 indicates the peer closed the connection.
+///
+/// The kernel writes the byte count into the parked actor's TEMP_VAL
+/// when the io_uring CQE arrives, so wrapping `rt_recv_async` in
+/// `ret` correctly forwards that value back to the caller.
+pub recv is {
+  conn i64 buf i64 size i64 -> ret i64 {
+    ret rt_recv_async(conn buf size)
+  }
+}
+
+/// Close `conn`.  Synchronous-return so callers can sequence
+/// teardown deterministically.
+pub close is {
+  conn i64 -> ret i64 {
+    rt_close(conn)
+    ret 0
+  }
+}

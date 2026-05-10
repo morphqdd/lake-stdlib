@@ -1,0 +1,31 @@
++std.tcp.{ listen accept recv send close }
++std.io.{ println print }
+
+@rt(rt_allocate)
+@rt(rt_write)
+
+handle is {
+  conn i64 -> {
+    let buf = rt_allocate(4096)
+    let n = recv(conn buf 4096)
+    rt_write(1 buf n)
+    let _ack = send(conn "HTTP/1.0 200 OK\r\nContent-Length: 3\r\n\r\nhi\n")
+    let _bye = close(conn)
+  }
+}
+
+accept_loop is {
+  srv i64 -> {
+    let conn = accept(srv)
+    handle(conn)
+    self(srv)
+  }
+}
+
+main is {
+  _ -> {
+    println("listening on :8080")
+    let srv = listen(8080)
+    accept_loop(srv)
+  }
+}

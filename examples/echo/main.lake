@@ -1,0 +1,17 @@
++std.tcp.{ listen accept send close }
+
+serve is {
+  srv i64 -> {
+    let conn = accept(srv)
+    let _ack = send(conn "hi from std.tcp\n")
+    let _bye = close(conn)
+    self(srv)
+  }
+}
+
+main is {
+  _ -> {
+    let srv = listen(8080)
+    serve(srv)
+  }
+}

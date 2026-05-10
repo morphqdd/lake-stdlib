@@ -6,14 +6,21 @@ everything lives on top of the runtime functions the compiler ships with.
 
 ## Modules
 
-| module      | exports                          | uses                       |
-|---          |---                               |---                         |
-| `std.io`    | `print`, `println`, `eprint`, `eprintln` | `rt_write`, `len`     |
-| `std.math`  | `abs`, `min`, `max`, `mod`       | (none — pure compute)      |
-| `std.sys`   | `exit`                           | `rt_exit`                  |
+| module      | exports                                  | uses                                              |
+|---          |---                                       |---                                                |
+| `std.io`    | `print`, `println`, `eprint`, `eprintln` | `rt_write`, `len`                                 |
+| `std.math`  | `abs`, `min`, `max`, `mod`               | (none — pure compute)                             |
+| `std.sys`   | `exit`                                   | `rt_exit`                                         |
+| `std.tcp`   | `listen`, `accept`, `recv`, `send`, `close` | `rt_listen_tcp`, `rt_accept_async`, `rt_recv_async`, `rt_send_async`, `rt_close`, `len` |
 
 Every machine here is `pub`.  Internal helpers (none yet) would be
 private by default.
+
+Most TCP wrappers are ret-typed — `let conn = accept(srv)` blocks the
+caller until the underlying io_uring CQE arrives, the same way the
+underlying `rt_accept_async` parks a direct caller.  The wrapper costs
+one extra mailbox roundtrip; for tight per-byte loops bypass the
+stdlib and call `rt_*` directly.
 
 ## Installation
 
@@ -64,6 +71,28 @@ hello from lake-stdlib
 
 `examples/hello/` — minimal program that imports `println` and prints a
 greeting.
+
+`examples/echo/` — TCP echo server using `std.tcp.{ listen, accept,
+send, close }`.
+
+`examples/http_print/` — listens on `:8080`, prints every incoming
+HTTP request to stdout, replies with a tiny `HTTP/1.0 200 OK`.
+Demonstrates the full `recv` → `print` → `send` → `close` flow over
+the stdlib.
+
+```bash
+$ STD_PATH=/path/to/lake-stdlib/std \
+    lakec examples/http_print/main.lake -r
+$ ./examples/http_print/build/main &
+listening on :8080
+$ curl -s http://127.0.0.1:8080/hello
+hi
+$ # server printed:
+GET /hello HTTP/1.1
+Host: 127.0.0.1:8080
+User-Agent: curl/...
+Accept: */*
+```
 
 ## License
 
