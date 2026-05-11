@@ -1,0 +1,354 @@
+// SHA-256 in pure Lake — FIPS 180-4.
+//
+// Public surface:
+//   pub sha256(buf i64 len i64)        -> ret i64   // returns fat-ptr to 32-byte digest
+//
+// Implementation notes:
+//   * No NOT operator in Lake — every `~x` reads as `x ^ -1`.
+//   * No runtime arrays — K (64 round constants) and H_init (8 IV
+//     words) are dispatched via a `when`-chain ret-machine, one
+//     constant per arm.  This compiles to a Cranelift Switch and
+//     stays O(1) per lookup.
+//   * Compression rounds carry a..h plus i as `self()` parameters;
+//     the message schedule W[64] lives on the heap (one scratch
+//     buffer per call).
+//
+//  Tested against `""`, `"abc"`, and `"a"*55..64` boundary inputs in
+//  benchmark/test/sha256_kat.lake.
+
++std.bytes.{ at set set_be32 be32 }
+
+@rt(rt_allocate)
+@rt(rt_copy_bytes)
+
+// ── helpers ────────────────────────────────────────────────────
+
+// 32-bit rotate right.  The high half is the unsigned shift left
+// of the low bits, masked back to 32 bits.
+rotr32 is {
+  x i64 n i64 -> ret i64 {
+    ret x >> n | (x << (32 - n)) & 0xffffffff
+  }
+}
+
+// Modular 32-bit add.  Lake's i64 wraps naturally on overflow but
+// downstream shifts care about the upper bits, so mask explicitly.
+add32 is {
+  a i64 b i64 -> ret i64 {
+    ret (a + b) & 0xffffffff
+  }
+}
+
+// SHA-256 mixing functions.
+ch is {
+  x i64 y i64 z i64 -> ret i64 {
+    ret x & y ^ (x ^ -1) & z
+  }
+}
+
+maj is {
+  x i64 y i64 z i64 -> ret i64 {
+    ret x & y ^ x & z ^ y & z
+  }
+}
+
+big_s0 is {
+  x i64 -> ret i64 {
+    ret rotr32(x 2) ^ rotr32(x 13) ^ rotr32(x 22)
+  }
+}
+
+big_s1 is {
+  x i64 -> ret i64 {
+    ret rotr32(x 6) ^ rotr32(x 11) ^ rotr32(x 25)
+  }
+}
+
+small_s0 is {
+  x i64 -> ret i64 {
+    ret rotr32(x 7) ^ rotr32(x 18) ^ x >> 3
+  }
+}
+
+small_s1 is {
+  x i64 -> ret i64 {
+    ret rotr32(x 17) ^ rotr32(x 19) ^ x >> 10
+  }
+}
+
+// ── round constants ─────────────────────────────────────────────
+// Sixty-four 32-bit values from FIPS 180-4 §4.2.2 (first 32 bits of
+// the fractional parts of the cube roots of the first 64 primes).
+// Lookup is O(1) — Cranelift lowers `when <int> { ... }` to a
+// Switch table.
+k is {
+  i i64 -> ret i64 {
+    when i {
+      0  -> { ret 0x428a2f98 }
+      1  -> { ret 0x71374491 }
+      2  -> { ret 0xb5c0fbcf }
+      3  -> { ret 0xe9b5dba5 }
+      4  -> { ret 0x3956c25b }
+      5  -> { ret 0x59f111f1 }
+      6  -> { ret 0x923f82a4 }
+      7  -> { ret 0xab1c5ed5 }
+      8  -> { ret 0xd807aa98 }
+      9  -> { ret 0x12835b01 }
+      10 -> { ret 0x243185be }
+      11 -> { ret 0x550c7dc3 }
+      12 -> { ret 0x72be5d74 }
+      13 -> { ret 0x80deb1fe }
+      14 -> { ret 0x9bdc06a7 }
+      15 -> { ret 0xc19bf174 }
+      16 -> { ret 0xe49b69c1 }
+      17 -> { ret 0xefbe4786 }
+      18 -> { ret 0x0fc19dc6 }
+      19 -> { ret 0x240ca1cc }
+      20 -> { ret 0x2de92c6f }
+      21 -> { ret 0x4a7484aa }
+      22 -> { ret 0x5cb0a9dc }
+      23 -> { ret 0x76f988da }
+      24 -> { ret 0x983e5152 }
+      25 -> { ret 0xa831c66d }
+      26 -> { ret 0xb00327c8 }
+      27 -> { ret 0xbf597fc7 }
+      28 -> { ret 0xc6e00bf3 }
+      29 -> { ret 0xd5a79147 }
+      30 -> { ret 0x06ca6351 }
+      31 -> { ret 0x14292967 }
+      32 -> { ret 0x27b70a85 }
+      33 -> { ret 0x2e1b2138 }
+      34 -> { ret 0x4d2c6dfc }
+      35 -> { ret 0x53380d13 }
+      36 -> { ret 0x650a7354 }
+      37 -> { ret 0x766a0abb }
+      38 -> { ret 0x81c2c92e }
+      39 -> { ret 0x92722c85 }
+      40 -> { ret 0xa2bfe8a1 }
+      41 -> { ret 0xa81a664b }
+      42 -> { ret 0xc24b8b70 }
+      43 -> { ret 0xc76c51a3 }
+      44 -> { ret 0xd192e819 }
+      45 -> { ret 0xd6990624 }
+      46 -> { ret 0xf40e3585 }
+      47 -> { ret 0x106aa070 }
+      48 -> { ret 0x19a4c116 }
+      49 -> { ret 0x1e376c08 }
+      50 -> { ret 0x2748774c }
+      51 -> { ret 0x34b0bcb5 }
+      52 -> { ret 0x391c0cb3 }
+      53 -> { ret 0x4ed8aa4a }
+      54 -> { ret 0x5b9cca4f }
+      55 -> { ret 0x682e6ff3 }
+      56 -> { ret 0x748f82ee }
+      57 -> { ret 0x78a5636f }
+      58 -> { ret 0x84c87814 }
+      59 -> { ret 0x8cc70208 }
+      60 -> { ret 0x90befffa }
+      61 -> { ret 0xa4506ceb }
+      62 -> { ret 0xbef9a3f7 }
+      63 -> { ret 0xc67178f2 }
+      _  -> { ret 0 }
+    }
+  }
+}
+
+// Initial hash value H(0).  First 32 bits of the fractional parts
+// of the square roots of the first 8 primes.
+h_init is {
+  i i64 -> ret i64 {
+    when i {
+      0 -> { ret 0x6a09e667 }
+      1 -> { ret 0xbb67ae85 }
+      2 -> { ret 0x3c6ef372 }
+      3 -> { ret 0xa54ff53a }
+      4 -> { ret 0x510e527f }
+      5 -> { ret 0x9b05688c }
+      6 -> { ret 0x1f83d9ab }
+      7 -> { ret 0x5be0cd19 }
+      _ -> { ret 0 }
+    }
+  }
+}
+
+// ── message schedule ───────────────────────────────────────────
+// Fill W[16..63] from the first 16 words copied out of the block.
+// Recursion preserves CPS reductions so the scheduler can yield
+// mid-fill on a tight quantum.
+fill_w is {
+  w i64 i i64 -> ret i64 {
+    when i == 64 {
+      true -> { ret 0 }
+      _    -> {
+        let s1 = small_s1(be32(w (i - 2) * 4))
+        let w7 = be32(w (i - 7) * 4)
+        let s0 = small_s0(be32(w (i - 15) * 4))
+        let w16 = be32(w (i - 16) * 4)
+        set_be32(w i * 4 add32(add32(s1 w7) add32(s0 w16)))
+        self(w i + 1)
+      }
+    }
+  }
+}
+
+// ── compression ───────────────────────────────────────────────
+// Run all 64 rounds for one block.  a..h are the working words;
+// w is the heap-buffer schedule produced by fill_w.  Returns the
+// updated (a,b,c,d,e,f,g,h) packed into vars by the calling code
+// reading them back out — this machine ends with a `ret` send
+// containing the final `a + h0`-style additions handled at top
+// level.
+//
+// We return only `0` here; the caller pins the final additions
+// after running compress to completion via tuples-by-side-effect:
+// each round writes a..h back through self(), so the *last*
+// invocation's parameters are observable through a fresh wrapper.
+//
+// To avoid that gymnastics in #66 we keep a small in-band
+// 8-word state buffer that the compress machine writes its
+// final a..h into before returning — see `state_buf` calls in
+// `process_block`.
+compress is {
+  st i64 w i64 i i64 a i64 b i64 c i64 d i64 e i64 f i64 g i64 h i64 -> ret i64 {
+    when i == 64 {
+      true -> {
+        set_be32(st 0  a)
+        set_be32(st 4  b)
+        set_be32(st 8  c)
+        set_be32(st 12 d)
+        set_be32(st 16 e)
+        set_be32(st 20 f)
+        set_be32(st 24 g)
+        set_be32(st 28 h)
+        ret 0
+      }
+      _ -> {
+        let t1 = add32(add32(add32(add32(h big_s1(e)) ch(e f g)) k(i)) be32(w i * 4))
+        let t2 = add32(big_s0(a) maj(a b c))
+        self(st w i + 1 add32(t1 t2) a b c add32(d t1) e f g)
+      }
+    }
+  }
+}
+
+// ── per-block driver ─────────────────────────────────────────
+// `block` is a 64-byte input block; `h` is the 8 × 4 = 32-byte
+// running hash state (big-endian H[0..7]).  After this call
+// `h` is updated in place.
+process_block is {
+  buf i64 off i64 h i64 -> ret i64 {
+    let w = rt_allocate(64 * 4)
+
+    // Copy the 64 input bytes verbatim into W[0..15].  The schedule
+    // expansion below treats W as 64 big-endian 32-bit words, so a
+    // byte-for-byte copy keeps the layout untouched.
+    rt_copy_bytes(w 0 buf off 64)
+    fill_w(w 16)
+
+    // Read H[0..7] into a..h locals so compress can mutate the
+    // working set without re-reading the running state.
+    let a0 = be32(h 0)
+    let b0 = be32(h 4)
+    let c0 = be32(h 8)
+    let d0 = be32(h 12)
+    let e0 = be32(h 16)
+    let f0 = be32(h 20)
+    let g0 = be32(h 24)
+    let h0 = be32(h 28)
+
+    // 32-byte scratch buffer where compress stashes its final a..h.
+    let st = rt_allocate(32)
+    compress(st w 0 a0 b0 c0 d0 e0 f0 g0 h0)
+
+    // H = H + working state, big-endian.
+    set_be32(h 0  add32(a0 be32(st 0)))
+    set_be32(h 4  add32(b0 be32(st 4)))
+    set_be32(h 8  add32(c0 be32(st 8)))
+    set_be32(h 12 add32(d0 be32(st 12)))
+    set_be32(h 16 add32(e0 be32(st 16)))
+    set_be32(h 20 add32(f0 be32(st 20)))
+    set_be32(h 24 add32(g0 be32(st 24)))
+    set_be32(h 28 add32(h0 be32(st 28)))
+    ret 0
+  }
+}
+
+// ── padding ──────────────────────────────────────────────────
+// FIPS 180-4 §5.1.1: append the 0x80 byte, then zeros until the
+// length ≡ 56 (mod 64), then the 64-bit big-endian message length
+// in *bits*.  The padded length is `((len + 9 + 63) / 64) * 64`.
+//
+// `padded_len(len) -> (padded_len, total_len_bytes)`: we just
+// return the padded length; bit-length is `len * 8`.
+padded_len is {
+  len i64 -> ret i64 {
+    ret (len + 9 + 63) & -64
+  }
+}
+
+// Build the padded message and return the buffer + its length.
+// Caller frees buf when done.
+//
+// We reuse a single allocation: the input bytes are copied in,
+// then padding is written on top in place.
+build_padded is {
+  src i64 len i64 -> ret i64 {
+    let total = padded_len(len)
+    let buf = rt_allocate(total)
+    rt_copy_bytes(buf 0 src 0 len)
+
+    // 0x80 byte right after the message.
+    set(buf len 0x80)
+
+    // Zeros from len+1 .. total-8 are guaranteed by the allocator
+    // returning zeroed memory (rt_allocate uses mmap-backed pages).
+
+    // 64-bit big-endian bit-length at the end.  Lake i64 holds the
+    // full count; split into hi32/lo32 for the two be32 writes.
+    let bits = len << 3
+    let bits_hi = bits >> 32 & 0xffffffff
+    let bits_lo = bits & 0xffffffff
+    set_be32(buf total - 8 bits_hi)
+    set_be32(buf total - 4 bits_lo)
+    ret buf
+  }
+}
+
+// ── per-block loop ───────────────────────────────────────────
+hash_blocks is {
+  buf i64 total i64 off i64 h i64 -> ret i64 {
+    when off == total {
+      true -> { ret 0 }
+      _    -> {
+        process_block(buf off h)
+        self(buf total (off + 64) h)
+      }
+    }
+  }
+}
+
+// ── public entry point ───────────────────────────────────────
+//
+// Usage:
+//   let digest = sha256(msg_buf, msg_len)
+//   // digest is a 32-byte fat-ptr; caller frees it.
+pub sha256 is {
+  src i64 len i64 -> ret i64 {
+    let h = rt_allocate(32)
+
+    // Initialise H with the eight IVs.
+    set_be32(h 0  h_init(0))
+    set_be32(h 4  h_init(1))
+    set_be32(h 8  h_init(2))
+    set_be32(h 12 h_init(3))
+    set_be32(h 16 h_init(4))
+    set_be32(h 20 h_init(5))
+    set_be32(h 24 h_init(6))
+    set_be32(h 28 h_init(7))
+
+    let padded = build_padded(src len)
+    let total = padded_len(len)
+    hash_blocks(padded total 0 h)
+    ret h
+  }
+}
