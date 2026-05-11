@@ -176,7 +176,7 @@ h_init is {
 // Recursion preserves CPS reductions so the scheduler can yield
 // mid-fill on a tight quantum.
 fill_w is {
-  w i64 i i64 -> ret i64 {
+  w buf i i64 -> ret i64 {
     when i == 64 {
       true -> { ret 0 }
       _    -> {
@@ -209,7 +209,7 @@ fill_w is {
 // final a..h into before returning — see `state_buf` calls in
 // `process_block`.
 compress is {
-  st i64 w i64 i i64 a i64 b i64 c i64 d i64 e i64 f i64 g i64 h i64 -> ret i64 {
+  st buf w buf i i64 a i64 b i64 c i64 d i64 e i64 f i64 g i64 h i64 -> ret i64 {
     when i == 64 {
       true -> {
         set_be32(st 0  a)
@@ -236,7 +236,7 @@ compress is {
 // running hash state (big-endian H[0..7]).  After this call
 // `h` is updated in place.
 process_block is {
-  buf i64 off i64 h i64 -> ret i64 {
+  buf buf off i64 h buf -> ret i64 {
     let w = rt_allocate(64 * 4)
 
     // Copy the 64 input bytes verbatim into W[0..15].  The schedule
@@ -292,7 +292,7 @@ padded_len is {
 // We reuse a single allocation: the input bytes are copied in,
 // then padding is written on top in place.
 build_padded is {
-  src i64 len i64 -> ret i64 {
+  src buf len i64 -> ret buf {
     let total = padded_len(len)
     let buf = rt_allocate(total)
     rt_copy_bytes(buf 0 src 0 len)
@@ -316,7 +316,7 @@ build_padded is {
 
 // ── per-block loop ───────────────────────────────────────────
 hash_blocks is {
-  buf i64 total i64 off i64 h i64 -> ret i64 {
+  buf buf total i64 off i64 h buf -> ret i64 {
     when off == total {
       true -> { ret 0 }
       _    -> {
@@ -333,7 +333,7 @@ hash_blocks is {
 //   let digest = sha256(msg_buf, msg_len)
 //   // digest is a 32-byte fat-ptr; caller frees it.
 pub sha256 is {
-  src i64 len i64 -> ret i64 {
+  src buf len i64 -> ret buf {
     let h = rt_allocate(32)
 
     // Initialise H with the eight IVs.

@@ -16,7 +16,7 @@
 
 // Concatenate two strings.  Result length = len(a) + len(b).
 pub concat is {
-  a str b str -> ret i64 {
+  a str b str -> ret buf {
     let la = len(a)
     let lb = len(b)
     let total = la + lb
@@ -29,7 +29,7 @@ pub concat is {
 
 // Three-way concat — common for `header + ": " + value` shapes.
 pub concat3 is {
-  a str b str c str -> ret i64 {
+  a str b str c str -> ret buf {
     let la = len(a)
     let lb = len(b)
     let lc = len(c)
@@ -46,7 +46,7 @@ pub concat3 is {
 // allocation; the source bytes are copied so the slice survives any
 // later free of `s`.
 pub slice is {
-  s str off i64 n i64 -> ret i64 {
+  s str off i64 n i64 -> ret buf {
     let dst = rt_allocate(n)
     rt_copy_bytes(dst 0 s off n)
     ret dst
