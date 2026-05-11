@@ -21,9 +21,11 @@
 // ── byte loads ─────────────────────────────────────────────────
 
 // Read one byte from `buf` at `off`, returned as i64.
+// Equivalent to the postfix-index operator `buf[off]`; kept as a
+// named wrapper for callers that prefer a function reference.
 pub at is {
   buf buf off i64 -> ret i64 {
-    ret rt_load_u8(buf off)
+    ret buf[off]
   }
 }
 
@@ -89,10 +91,10 @@ pub set64 is {
 // on a dedicated rt-fn.
 pub be32 is {
   buf buf off i64 -> ret i64 {
-    let b0 = rt_load_u8(buf off)
-    let b1 = rt_load_u8(buf off + 1)
-    let b2 = rt_load_u8(buf off + 2)
-    let b3 = rt_load_u8(buf off + 3)
+    let b0 = buf[off]
+    let b1 = buf[off + 1]
+    let b2 = buf[off + 2]
+    let b3 = buf[off + 3]
     ret b0 << 24 | b1 << 16 | b2 << 8 | b3
   }
 }
