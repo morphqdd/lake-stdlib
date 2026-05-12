@@ -81,75 +81,80 @@ small_s1 is {
 // the fractional parts of the cube roots of the first 64 primes).
 // Lookup is O(1) — Cranelift lowers `when <int> { ... }` to a
 // Switch table.
-k is {
-  i i64 -> ret i64 {
-    when i {
-      0  -> { ret 0x428a2f98 }
-      1  -> { ret 0x71374491 }
-      2  -> { ret 0xb5c0fbcf }
-      3  -> { ret 0xe9b5dba5 }
-      4  -> { ret 0x3956c25b }
-      5  -> { ret 0x59f111f1 }
-      6  -> { ret 0x923f82a4 }
-      7  -> { ret 0xab1c5ed5 }
-      8  -> { ret 0xd807aa98 }
-      9  -> { ret 0x12835b01 }
-      10 -> { ret 0x243185be }
-      11 -> { ret 0x550c7dc3 }
-      12 -> { ret 0x72be5d74 }
-      13 -> { ret 0x80deb1fe }
-      14 -> { ret 0x9bdc06a7 }
-      15 -> { ret 0xc19bf174 }
-      16 -> { ret 0xe49b69c1 }
-      17 -> { ret 0xefbe4786 }
-      18 -> { ret 0x0fc19dc6 }
-      19 -> { ret 0x240ca1cc }
-      20 -> { ret 0x2de92c6f }
-      21 -> { ret 0x4a7484aa }
-      22 -> { ret 0x5cb0a9dc }
-      23 -> { ret 0x76f988da }
-      24 -> { ret 0x983e5152 }
-      25 -> { ret 0xa831c66d }
-      26 -> { ret 0xb00327c8 }
-      27 -> { ret 0xbf597fc7 }
-      28 -> { ret 0xc6e00bf3 }
-      29 -> { ret 0xd5a79147 }
-      30 -> { ret 0x06ca6351 }
-      31 -> { ret 0x14292967 }
-      32 -> { ret 0x27b70a85 }
-      33 -> { ret 0x2e1b2138 }
-      34 -> { ret 0x4d2c6dfc }
-      35 -> { ret 0x53380d13 }
-      36 -> { ret 0x650a7354 }
-      37 -> { ret 0x766a0abb }
-      38 -> { ret 0x81c2c92e }
-      39 -> { ret 0x92722c85 }
-      40 -> { ret 0xa2bfe8a1 }
-      41 -> { ret 0xa81a664b }
-      42 -> { ret 0xc24b8b70 }
-      43 -> { ret 0xc76c51a3 }
-      44 -> { ret 0xd192e819 }
-      45 -> { ret 0xd6990624 }
-      46 -> { ret 0xf40e3585 }
-      47 -> { ret 0x106aa070 }
-      48 -> { ret 0x19a4c116 }
-      49 -> { ret 0x1e376c08 }
-      50 -> { ret 0x2748774c }
-      51 -> { ret 0x34b0bcb5 }
-      52 -> { ret 0x391c0cb3 }
-      53 -> { ret 0x4ed8aa4a }
-      54 -> { ret 0x5b9cca4f }
-      55 -> { ret 0x682e6ff3 }
-      56 -> { ret 0x748f82ee }
-      57 -> { ret 0x78a5636f }
-      58 -> { ret 0x84c87814 }
-      59 -> { ret 0x8cc70208 }
-      60 -> { ret 0x90befffa }
-      61 -> { ret 0xa4506ceb }
-      62 -> { ret 0xbef9a3f7 }
-      63 -> { ret 0xc67178f2 }
-      _  -> { ret 0 }
-    }
+// Initial K constants — first 32 bits of the fractional parts of the
+// cube roots of the first 64 primes (FIPS 180-4 §4.2.2).  Hashing
+// previously fetched these via a 64-arm when-dispatched ret-machine
+// `k(i)`, which paid spawn+wait overhead per round.  We now build a
+// 64×4-byte table once and read it inline via `be32(k_tbl, i*4)` —
+// eliminates ~1M ret-machine calls per 1 MiB hashed.
+init_k_table is {
+  _ i64 -> ret buf {
+    let k = rt_allocate(64 * 4)
+    set_be32(k 0     0x428a2f98)
+    set_be32(k 4     0x71374491)
+    set_be32(k 8     0xb5c0fbcf)
+    set_be32(k 12    0xe9b5dba5)
+    set_be32(k 16    0x3956c25b)
+    set_be32(k 20    0x59f111f1)
+    set_be32(k 24    0x923f82a4)
+    set_be32(k 28    0xab1c5ed5)
+    set_be32(k 32    0xd807aa98)
+    set_be32(k 36    0x12835b01)
+    set_be32(k 40    0x243185be)
+    set_be32(k 44    0x550c7dc3)
+    set_be32(k 48    0x72be5d74)
+    set_be32(k 52    0x80deb1fe)
+    set_be32(k 56    0x9bdc06a7)
+    set_be32(k 60    0xc19bf174)
+    set_be32(k 64    0xe49b69c1)
+    set_be32(k 68    0xefbe4786)
+    set_be32(k 72    0x0fc19dc6)
+    set_be32(k 76    0x240ca1cc)
+    set_be32(k 80    0x2de92c6f)
+    set_be32(k 84    0x4a7484aa)
+    set_be32(k 88    0x5cb0a9dc)
+    set_be32(k 92    0x76f988da)
+    set_be32(k 96    0x983e5152)
+    set_be32(k 100   0xa831c66d)
+    set_be32(k 104   0xb00327c8)
+    set_be32(k 108   0xbf597fc7)
+    set_be32(k 112   0xc6e00bf3)
+    set_be32(k 116   0xd5a79147)
+    set_be32(k 120   0x06ca6351)
+    set_be32(k 124   0x14292967)
+    set_be32(k 128   0x27b70a85)
+    set_be32(k 132   0x2e1b2138)
+    set_be32(k 136   0x4d2c6dfc)
+    set_be32(k 140   0x53380d13)
+    set_be32(k 144   0x650a7354)
+    set_be32(k 148   0x766a0abb)
+    set_be32(k 152   0x81c2c92e)
+    set_be32(k 156   0x92722c85)
+    set_be32(k 160   0xa2bfe8a1)
+    set_be32(k 164   0xa81a664b)
+    set_be32(k 168   0xc24b8b70)
+    set_be32(k 172   0xc76c51a3)
+    set_be32(k 176   0xd192e819)
+    set_be32(k 180   0xd6990624)
+    set_be32(k 184   0xf40e3585)
+    set_be32(k 188   0x106aa070)
+    set_be32(k 192   0x19a4c116)
+    set_be32(k 196   0x1e376c08)
+    set_be32(k 200   0x2748774c)
+    set_be32(k 204   0x34b0bcb5)
+    set_be32(k 208   0x391c0cb3)
+    set_be32(k 212   0x4ed8aa4a)
+    set_be32(k 216   0x5b9cca4f)
+    set_be32(k 220   0x682e6ff3)
+    set_be32(k 224   0x748f82ee)
+    set_be32(k 228   0x78a5636f)
+    set_be32(k 232   0x84c87814)
+    set_be32(k 236   0x8cc70208)
+    set_be32(k 240   0x90befffa)
+    set_be32(k 244   0xa4506ceb)
+    set_be32(k 248   0xbef9a3f7)
+    set_be32(k 252   0xc67178f2)
+    ret k
   }
 }
 
@@ -209,7 +214,7 @@ fill_w is {
 // final a..h into before returning — see `state_buf` calls in
 // `process_block`.
 compress is {
-  st buf w buf i i64 a i64 b i64 c i64 d i64 e i64 f i64 g i64 h i64 -> ret i64 {
+  st buf w buf k_tbl buf i i64 a i64 b i64 c i64 d i64 e i64 f i64 g i64 h i64 -> ret i64 {
     when i == 64 {
       true -> {
         set_be32(st 0  a)
@@ -223,9 +228,9 @@ compress is {
         ret 0
       }
       _ -> {
-        let t1 = add32(add32(add32(add32(h big_s1(e)) ch(e f g)) k(i)) be32(w i * 4))
+        let t1 = add32(add32(add32(add32(h big_s1(e)) ch(e f g)) be32(k_tbl i * 4)) be32(w i * 4))
         let t2 = add32(big_s0(a) maj(a b c))
-        self(st w i + 1 add32(t1 t2) a b c add32(d t1) e f g)
+        self(st w k_tbl i + 1 add32(t1 t2) a b c add32(d t1) e f g)
       }
     }
   }
@@ -236,7 +241,7 @@ compress is {
 // running hash state (big-endian H[0..7]).  After this call
 // `h` is updated in place.
 process_block is {
-  buf buf off i64 h buf -> ret i64 {
+  buf buf off i64 h buf k_tbl buf -> ret i64 {
     let w = rt_allocate(64 * 4)
 
     // Copy the 64 input bytes verbatim into W[0..15].  The schedule
@@ -258,7 +263,7 @@ process_block is {
 
     // 32-byte scratch buffer where compress stashes its final a..h.
     let st = rt_allocate(32)
-    compress(st w 0 a0 b0 c0 d0 e0 f0 g0 h0)
+    compress(st w k_tbl 0 a0 b0 c0 d0 e0 f0 g0 h0)
 
     // H = H + working state, big-endian.
     set_be32(h 0  add32(a0 be32(st 0)))
@@ -316,12 +321,12 @@ build_padded is {
 
 // ── per-block loop ───────────────────────────────────────────
 hash_blocks is {
-  buf buf total i64 off i64 h buf -> ret i64 {
+  buf buf total i64 off i64 h buf k_tbl buf -> ret i64 {
     when off == total {
       true -> { ret 0 }
       _    -> {
-        process_block(buf off h)
-        self(buf total (off + 64) h)
+        process_block(buf off h k_tbl)
+        self(buf total (off + 64) h k_tbl)
       }
     }
   }
@@ -348,7 +353,8 @@ pub sha256 is {
 
     let padded = build_padded(src len)
     let total = padded_len(len)
-    hash_blocks(padded total 0 h)
+    let k_tbl = init_k_table(0)
+    hash_blocks(padded total 0 h k_tbl)
     ret h
   }
 }
