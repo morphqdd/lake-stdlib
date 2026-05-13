@@ -1,0 +1,89 @@
+// HMAC-SHA256 — RFC 2104.  Builds on `std.crypto.sha256`.
+//
+// HMAC(K, m) = SHA-256( (K' XOR opad) || SHA-256( (K' XOR ipad) || m ) )
+//   where K' is K padded to the 64-byte block size (or its SHA-256
+//   hash if K is longer than that), ipad = 0x36 × 64, opad = 0x5C × 64.
+//
+// Verified against `hmac.HMAC(key, msg, sha256).hexdigest()` —
+// see `benchmark/test/hmac_kat.lake` (TODO).
+
++std.bytes.{ at set }
++std.crypto.sha256.{ sha256 }
++std.process.{ alloc_or_die }
+@rt(rt_copy_bytes)
+
+// SHA-256 block size — the key is XOR'd into a 64-byte buffer.
+// SHA-256 digest size — 32 bytes.
+
+// hmac_sha256(key, key_len, msg, msg_len) → 32-byte digest buffer.
+pub hmac_sha256 is {
+  key buf key_len i64 msg buf msg_len i64 -> ret buf {
+    let nk_pair = normalize_key(key key_len)
+    let k_norm = nk_pair.1
+    let k_len = nk_pair.0
+    let inner_in = build_padded_block(k_norm k_len 54)  // 54 = 0x36
+    let outer_in = build_padded_block(k_norm k_len 92)  // 92 = 0x5C
+    // inner = sha256( (k XOR ipad) || msg )
+    let inner_buf = concat_buf(inner_in 64 msg msg_len)
+    let total_inner = 64 + msg_len
+    let inner_hash = sha256(inner_buf total_inner)
+    // outer = sha256( (k XOR opad) || inner )
+    let outer_buf = concat_buf(outer_in 64 inner_hash 32)
+    let out = sha256(outer_buf 96)
+    ret out
+  }
+}
+
+// Returns `{ effective_len, buf }`.  When `key_len > 64`, replaces
+// the key with its 32-byte SHA-256 hash; otherwise hands back the
+// original key with its real length.  The tuple shape mirrors
+// `{atom T}` so callers can destructure with positional `.0`/`.1`.
+normalize_key is {
+  key buf key_len i64 -> ret {i64 buf} {
+    when key_len > 64 {
+      true  -> {
+        let h = sha256(key key_len)
+        ret { 32 h }
+      }
+      false -> { ret { key_len key } }
+    }
+  }
+}
+
+// Allocate 64 bytes, copy `key` into the first `key_len`, leave
+// the rest zero (rt_allocate-backed pages are mmap'd, so the tail
+// is already 0x00), then XOR every byte with `pad` (0x36 ipad /
+// 0x5C opad).
+build_padded_block is {
+  key buf key_len i64 pad i64 -> ret buf {
+    let block = alloc_or_die(64)
+    rt_copy_bytes(block 0 key 0 key_len)
+    xor_loop(block 0 64 pad)
+    ret block
+  }
+}
+
+// Loop: dst[i] = dst[i] XOR pad, for i in [start..end).
+xor_loop is {
+  dst buf i i64 end i64 pad i64 -> ret i64 {
+    when i >= end {
+      true -> { ret 0 }
+      false -> {
+        let cur = at(dst i)
+        let new = cur ^ pad
+        set(dst i new)
+        self(dst i + 1 end pad)
+      }
+    }
+  }
+}
+
+// Concatenate two buffers into a fresh `len_a + len_b` block.
+concat_buf is {
+  a buf len_a i64 b buf len_b i64 -> ret buf {
+    let out = alloc_or_die(len_a + len_b)
+    rt_copy_bytes(out 0 a 0 len_a)
+    rt_copy_bytes(out len_a b 0 len_b)
+    ret out
+  }
+}

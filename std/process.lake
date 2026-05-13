@@ -41,14 +41,14 @@ pub die is {
 // request, fall back to a static buffer) or call `die()` to give up.
 //
 // Phase 2a (#78) recognises this body as pure (rt_allocate is on
-// the whitelist), so `pin alloc(N)` substitutes inline at the call
-// site and incurs no spawn+wait overhead vs the direct rt-call.
+// the whitelist), so the call substitutes inline at the call site
+// and incurs no spawn+wait overhead vs the direct rt-call.
 //
 // Use site:
 //
 //     +std.process.{ alloc, die }
 //     ...
-//     let r = pin alloc(4096)
+//     let r = alloc(4096)
 //     when r.0 {
 //       :ok  -> { /* r.1 is a fresh buf */ }
 //       :err -> { /* fallback or `die()` */ }
@@ -56,5 +56,27 @@ pub die is {
 pub alloc is {
   n i64 -> ret {atom buf} {
     ret rt_allocate(n)
+  }
+}
+
+// `alloc_or_die(n)` — convenience wrapper that pattern-matches the
+// tuple ABI for you.  On `:ok` returns the buf directly; on `:err`
+// `die()`s the current actor and returns the `:err` atom as the
+// "buf" (never observed by callers — the actor is unlinked at the
+// next quantum tick before the bogus value can be dereferenced).
+//
+// Suitable for stdlib helpers and application code where OOM
+// recovery is out of scope — the alternative is the explicit
+// `when r.0 { :ok -> ... :err -> ... }` ladder that `alloc` gives.
+pub alloc_or_die is {
+  n i64 -> ret buf {
+    let r = rt_allocate(n)
+    when r.0 {
+      :ok -> { ret r.1 }
+      _   -> {
+        die()
+        ret r.1
+      }
+    }
   }
 }

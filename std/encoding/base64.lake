@@ -1,0 +1,247 @@
+// Base64 encoder / decoder — RFC 4648 standard alphabet
+// (`A..Z a..z 0..9 + /`) with `=` padding.
+//
+// Both `encode` and `decode` allocate the result buffer via
+// `std.process.alloc_or_die`.  Callers own the returned buf.
+//
+// Test vectors (RFC 4648 §10) verified against Python's `base64`
+// module — see `benchmark/test/base64_kat.lake` (TODO).
+
++std.bytes.{ at set }
++std.process.{ alloc_or_die }
+
+// ── alphabet ────────────────────────────────────────────────────
+
+// Map a 6-bit index (0..63) to its Base64 ASCII character code.
+//   0..25  → 'A'..'Z'  (65..90)
+//   26..51 → 'a'..'z'  (97..122)
+//   52..61 → '0'..'9'  (48..57)
+//   62     → '+'       (43)
+//   63     → '/'       (47)
+// Pure ret-machine — #78 inlines at every call site.
+b64_encode_char is {
+  i i64 -> ret i64 {
+    when i <= 25 {
+      true  -> { ret i + 65 }
+      false -> {
+        when i <= 51 {
+          true  -> { ret i + 71 }
+          false -> {
+            when i <= 61 {
+              true  -> { ret i - 4 }
+              false -> {
+                when i == 62 {
+                  true  -> { ret 43 }
+                  false -> { ret 47 }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// Inverse: ASCII byte → 6-bit index, 64 for `=` padding, 255 for
+// "not Base64" (whitespace, line breaks etc — callers receiving
+// PEM-style input should pre-filter).
+b64_decode_char is {
+  c i64 -> ret i64 {
+    when c == 61 {
+      true  -> { ret 64 }
+      false -> {
+        when c >= 65 {
+          true -> {
+            when c <= 90 {
+              true  -> { ret c - 65 }
+              false -> {
+                when c >= 97 {
+                  true -> {
+                    when c <= 122 {
+                      true  -> { ret c - 71 }
+                      false -> { ret 255 }
+                    }
+                  }
+                  false -> { ret 255 }
+                }
+              }
+            }
+          }
+          false -> {
+            when c >= 48 {
+              true -> {
+                when c <= 57 {
+                  true  -> { ret c + 4 }
+                  false -> { ret 255 }
+                }
+              }
+              false -> {
+                when c == 43 {
+                  true  -> { ret 62 }
+                  false -> {
+                    when c == 47 {
+                      true  -> { ret 63 }
+                      false -> { ret 255 }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// ── encode ──────────────────────────────────────────────────────
+
+// Encode `len` bytes from `src` into a fresh fat-ptr buffer.
+// Output length is `4 * ((len + 2) / 3)` — Base64 expansion plus
+// `=` padding to a multiple of 4.  Returns the allocated buf.
+pub encode is {
+  src buf len i64 -> ret buf {
+    let triplets = (len + 2) / 3
+    let out_len = triplets * 4
+    let dst = alloc_or_die(out_len)
+    encode_loop(src len 0 dst 0)
+    ret dst
+  }
+}
+
+// Triplet-by-triplet inner loop.  Reads 3 source bytes (zero-
+// padded when fewer remain), packs them into a 24-bit value,
+// slices that into four 6-bit indices, and writes 4 ASCII bytes.
+// `=` (0x3D = 61) substitutes for indices the source didn't cover.
+encode_loop is {
+  src buf len i64 si i64 dst buf di i64 -> ret i64 {
+    when si >= len {
+      true -> { ret 0 }
+      false -> {
+        let rem = len - si
+        let b0 = at(src si)
+        let b1 = encode_pick(src si rem 2)
+        let b2 = encode_pick(src si rem 3)
+        let v = b0 << 16 | b1 << 8 | b2
+        let i0 = v >> 18 & 0x3f
+        let i1 = v >> 12 & 0x3f
+        let i2 = v >> 6 & 0x3f
+        let i3 = v & 0x3f
+        let c0 = b64_encode_char(i0)
+        let c1 = b64_encode_char(i1)
+        let c2 = b64_encode_char(i2)
+        let c3 = b64_encode_char(i3)
+        set(dst di     c0)
+        set(dst di + 1 c1)
+        when rem >= 2 {
+          true  -> { set(dst di + 2 c2) }
+          false -> { set(dst di + 2 61) }
+        }
+        when rem >= 3 {
+          true  -> { set(dst di + 3 c3) }
+          false -> { set(dst di + 3 61) }
+        }
+        self(src len si + 3 dst di + 4)
+      }
+    }
+  }
+}
+
+// Returns the `nth` source byte if it lies in [si, si+len),
+// otherwise 0 (later replaced with `=` padding).
+encode_pick is {
+  src buf si i64 rem i64 nth i64 -> ret i64 {
+    when rem >= nth {
+      true  -> { ret at(src si + nth - 1) }
+      false -> { ret 0 }
+    }
+  }
+}
+
+// ── decode ──────────────────────────────────────────────────────
+
+// Decode `len` Base64-encoded bytes from `src` into a fresh
+// buffer.  `len` MUST be a multiple of 4.  Returned buf is sized
+// for the worst case `(len / 4) * 3`; the real payload length is
+// available from `decoded_len`.
+pub decode is {
+  src buf len i64 -> ret buf {
+    let groups = len / 4
+    let out_max = groups * 3
+    let dst = alloc_or_die(out_max)
+    decode_loop(src len 0 dst 0)
+    ret dst
+  }
+}
+
+// Return how many bytes `decode(src, len)` actually wrote.
+pub decoded_len is {
+  src buf len i64 -> ret i64 {
+    when len == 0 {
+      true  -> { ret 0 }
+      false -> {
+        let groups = len / 4
+        let pad = decoded_pad_count(src len)
+        ret groups * 3 - pad
+      }
+    }
+  }
+}
+
+decoded_pad_count is {
+  src buf len i64 -> ret i64 {
+    let last = at(src len - 1)
+    when last == 61 {
+      true -> {
+        let prev = at(src len - 2)
+        when prev == 61 {
+          true  -> { ret 2 }
+          false -> { ret 1 }
+        }
+      }
+      false -> { ret 0 }
+    }
+  }
+}
+
+// Quartet-by-quartet inner loop.  Reads 4 Base64 chars, maps each
+// to its 6-bit index (or 64 for `=`), packs them into a 24-bit
+// value, and writes 1-3 output bytes depending on how many `='s
+// fill the quartet's tail.
+decode_loop is {
+  src buf len i64 si i64 dst buf di i64 -> ret i64 {
+    when si >= len {
+      true -> { ret 0 }
+      false -> {
+        let i0 = b64_decode_char(at(src si))
+        let i1 = b64_decode_char(at(src si + 1))
+        let i2 = b64_decode_char(at(src si + 2))
+        let i3 = b64_decode_char(at(src si + 3))
+        // i2, i3 are already 0..63 from b64_decode_char (`=` → 64
+        // observed by the early-exit branches below), so the 0x3F
+        // mask in the pack expression is redundant — *and* would
+        // bind incorrectly under Lake's C-style precedence
+        // (`i2 & 0x3f << 6` would group as `i2 & (0x3f << 6)`).
+        let v = i0 << 18 | i1 << 12 | i2 << 6 | i3
+        let b0 = v >> 16 & 0xff
+        let b1 = v >> 8 & 0xff
+        let b2 = v & 0xff
+        set(dst di b0)
+        when i2 == 64 {
+          true  -> { ret 0 }
+          false -> {
+            set(dst di + 1 b1)
+            when i3 == 64 {
+              true  -> { ret 0 }
+              false -> {
+                set(dst di + 2 b2)
+                self(src len si + 4 dst di + 3)
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
