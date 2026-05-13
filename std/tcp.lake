@@ -51,7 +51,7 @@ pub send is {
 /// when the io_uring CQE arrives, so wrapping `rt_recv_async` in
 /// `ret` correctly forwards that value back to the caller.
 pub recv is {
-  conn i64 buf i64 size i64 -> ret i64 {
+  conn i64 buf buf size i64 -> ret i64 {
     ret rt_recv_async(conn buf size)
   }
 }

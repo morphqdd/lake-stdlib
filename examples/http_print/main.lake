@@ -1,16 +1,23 @@
 +std.tcp.{ listen accept recv send close }
 +std.io.{ println print }
++std.process.{ die }
 
 @rt(rt_allocate)
 @rt(rt_write)
 
 handle is {
   conn i64 -> {
-    let buf = rt_allocate(4096)
-    let n = recv(conn buf 4096)
-    rt_write(1 buf n)
-    let _ack = send(conn "HTTP/1.0 200 OK\r\nContent-Length: 3\r\n\r\nhi\n")
-    let _bye = close(conn)
+    let r = rt_allocate(4096)
+    when r.0 {
+      :ok -> {
+        let buf = r.1
+        let n = recv(conn buf 4096)
+        rt_write(1 buf n)
+        let _ack = send(conn "HTTP/1.0 200 OK\r\nContent-Length: 3\r\n\r\nhi\n")
+        let _bye = close(conn)
+      }
+      _ -> { die() }
+    }
   }
 }
 

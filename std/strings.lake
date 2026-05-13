@@ -7,8 +7,18 @@
 //
 // All wrappers are `ret`-typed so they compose with `let` and `pin`.
 //
+// `rt_allocate` returns `{atom buf}` under the tuple ABI (#87) —
+// callers pattern-match on `r.0` and dispatch.  On `:err` we call
+// `+std.process.die` (a Phase 2a-inlined wrapper over `rt_die_actor`)
+// so the scheduler removes the dying actor cleanly at the next
+// quantum boundary.  The synthesised `ret r.1` after `die()` is
+// dead code path-wise but required for the ret-machine return-type
+// check.
+//
 // For a slower but rt_copy_bytes-free implementation see
 // `std/experimental/strings.lake`.
+
++std.process.{ die }
 
 @rt(rt_allocate)
 @rt(rt_copy_bytes)
@@ -20,10 +30,19 @@ pub concat is {
     let la = len(a)
     let lb = len(b)
     let total = la + lb
-    let dst = rt_allocate(total)
-    rt_copy_bytes(dst 0 a 0 la)
-    rt_copy_bytes(dst la b 0 lb)
-    ret dst
+    let r = rt_allocate(total)
+    when r.0 {
+      :ok -> {
+        let dst = r.1
+        rt_copy_bytes(dst 0 a 0 la)
+        rt_copy_bytes(dst la b 0 lb)
+        ret dst
+      }
+      _ -> {
+        die()
+        ret r.1
+      }
+    }
   }
 }
 
@@ -34,11 +53,20 @@ pub concat3 is {
     let lb = len(b)
     let lc = len(c)
     let total = la + lb + lc
-    let dst = rt_allocate(total)
-    rt_copy_bytes(dst 0       a 0 la)
-    rt_copy_bytes(dst la      b 0 lb)
-    rt_copy_bytes(dst la + lb c 0 lc)
-    ret dst
+    let r = rt_allocate(total)
+    when r.0 {
+      :ok -> {
+        let dst = r.1
+        rt_copy_bytes(dst 0       a 0 la)
+        rt_copy_bytes(dst la      b 0 lb)
+        rt_copy_bytes(dst la + lb c 0 lc)
+        ret dst
+      }
+      _ -> {
+        die()
+        ret r.1
+      }
+    }
   }
 }
 
@@ -47,8 +75,17 @@ pub concat3 is {
 // later free of `s`.
 pub slice is {
   s str off i64 n i64 -> ret buf {
-    let dst = rt_allocate(n)
-    rt_copy_bytes(dst 0 s off n)
-    ret dst
+    let r = rt_allocate(n)
+    when r.0 {
+      :ok -> {
+        let dst = r.1
+        rt_copy_bytes(dst 0 s off n)
+        ret dst
+      }
+      _ -> {
+        die()
+        ret r.1
+      }
+    }
   }
 }

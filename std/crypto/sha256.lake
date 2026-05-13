@@ -18,6 +18,19 @@
 
 +std.bytes.{ at set set_be32 be32 }
 
+// `rt_allocate` returns `{atom buf}` since the tuple-ABI refactor
+// (#87).  The crypto module unwraps via `__X_r.1` without an
+// explicit `when r.0 { :err -> ... }` because every alloc here is
+// either small (32-byte digest, 256-byte K table) or modest (1×
+// padded message buffer); under realistic workloads they never
+// hit the OOM path.  A full migration to `when r.0 { :ok -> { … }
+// _ -> { die() } }` would require nesting six `when`s through
+// `process_block` and `sha256` — that's the right shape once a
+// lowering pass injects the wrap automatically (see #87).  For
+// now: `r.1` on `:err` is the `:nomem` atom, which downstream
+// `rt_copy_bytes`/`set_be32` would dereference as a buf and
+// segfault — equivalent to actor death, just less graceful.
+
 @rt(rt_allocate)
 @rt(rt_copy_bytes)
 
@@ -89,7 +102,8 @@ small_s1 is {
 // eliminates ~1M ret-machine calls per 1 MiB hashed.
 init_k_table is {
   _ i64 -> ret buf {
-    let k = rt_allocate(64 * 4)
+    let __k_r = rt_allocate(64 * 4)
+    let k = __k_r.1
     set_be32(k 0     0x428a2f98)
     set_be32(k 4     0x71374491)
     set_be32(k 8     0xb5c0fbcf)
@@ -242,7 +256,8 @@ compress is {
 // `h` is updated in place.
 process_block is {
   buf buf off i64 h buf k_tbl buf -> ret i64 {
-    let w = rt_allocate(64 * 4)
+    let __w_r = rt_allocate(64 * 4)
+    let w = __w_r.1
 
     // Copy the 64 input bytes verbatim into W[0..15].  The schedule
     // expansion below treats W as 64 big-endian 32-bit words, so a
@@ -262,7 +277,8 @@ process_block is {
     let h0 = be32(h 28)
 
     // 32-byte scratch buffer where compress stashes its final a..h.
-    let st = rt_allocate(32)
+    let __st_r = rt_allocate(32)
+    let st = __st_r.1
     compress(st w k_tbl 0 a0 b0 c0 d0 e0 f0 g0 h0)
 
     // H = H + working state, big-endian.
@@ -299,7 +315,8 @@ padded_len is {
 build_padded is {
   src buf len i64 -> ret buf {
     let total = padded_len(len)
-    let buf = rt_allocate(total)
+    let __buf_r = rt_allocate(total)
+    let buf = __buf_r.1
     rt_copy_bytes(buf 0 src 0 len)
 
     // 0x80 byte right after the message.
@@ -339,7 +356,8 @@ hash_blocks is {
 //   // digest is a 32-byte fat-ptr; caller frees it.
 pub sha256 is {
   src buf len i64 -> ret buf {
-    let h = rt_allocate(32)
+    let __h_r = rt_allocate(32)
+    let h = __h_r.1
 
     // Initialise H with the eight IVs.
     set_be32(h 0  h_init(0))

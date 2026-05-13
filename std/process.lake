@@ -1,0 +1,60 @@
+// Process-control helpers.  Thin wrappers around the rt-fns that
+// drive scheduler-visible actor state, exposed under a stable
+// stdlib import path so user code doesn't have to sprinkle
+// `@rt(rt_die_actor)` directives.
+//
+// `die` is recognised as a pure ret-machine (rt_die_actor is in the
+// pure_rt_funcs whitelist), so #78 substitutes the call inline at
+// every use site — `pin die()` ends up as a direct `rt_die_actor`
+// invocation in the *caller's* actor context, marking the right
+// process for unlink at the next quantum boundary.  Without that
+// inline expansion the wrapper would spawn a child actor that dies
+// instead, which is not the semantics user code wants.
+
+@rt(rt_allocate)
+@rt(rt_die_actor)
+
+// Mark the current actor for death.  The scheduler observes
+// `exec_ctx.IS_DYING` at the next quantum tick and returns
+// STOP_DONE, unlinking the actor cleanly.  Side effects already
+// queued (sends, etc.) are retained in their respective mailboxes;
+// only the dying actor's machine fn stops executing.
+//
+// Use site:
+//
+//     +std.process.{ die }
+//     ...
+//     when r.0 {
+//       :ok -> { /* happy path */ }
+//       _   -> { die() }
+//     }
+pub die is {
+  _ -> ret {} {
+    rt_die_actor()
+  }
+}
+
+// `alloc(n)` — stdlib re-export of the tuple-ABI `rt_allocate`.
+// Returns `{atom buf}`: `:ok` carries the buf in `.1`, `:err` carries
+// the reason atom (currently always `:nomem`) in `.1`.  Callers
+// pattern-match — they decide whether to recover (e.g. shrink the
+// request, fall back to a static buffer) or call `die()` to give up.
+//
+// Phase 2a (#78) recognises this body as pure (rt_allocate is on
+// the whitelist), so `pin alloc(N)` substitutes inline at the call
+// site and incurs no spawn+wait overhead vs the direct rt-call.
+//
+// Use site:
+//
+//     +std.process.{ alloc, die }
+//     ...
+//     let r = pin alloc(4096)
+//     when r.0 {
+//       :ok  -> { /* r.1 is a fresh buf */ }
+//       :err -> { /* fallback or `die()` */ }
+//     }
+pub alloc is {
+  n i64 -> ret {atom buf} {
+    ret rt_allocate(n)
+  }
+}
