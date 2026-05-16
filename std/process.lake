@@ -13,6 +13,9 @@
 
 @rt(rt_allocate)
 @rt(rt_die_actor)
+// Global process exit lives in `std.sys.exit` — re-importing it
+// here would create a duplicate `exit` name (`std.process.exit`
+// vs `std.sys.exit`) and trigger the name-collision bug #97.
 
 // Mark the current actor for death.  The scheduler observes
 // `exec_ctx.IS_DYING` at the next quantum tick and returns

@@ -1,0 +1,153 @@
+// Direct-syscall filesystem wrappers — open / read / close / mkdir.
+//
+// The `experimental.sys` module exposes `rt_syscall` and the
+// numeric SYS_* constants; this module gives them a Lake-typed
+// surface that returns `{atom i64}` tuples so callers can decide
+// whether a failed open kills their actor or routes through an
+// error-handling branch:
+//
+//     +std.experimental.fs.{ open close O_RDONLY }
+//     let r = open(path 0 0)
+//     when r.0 {
+//       :ok  -> { let fd = r.1 ; … ; close(fd) }
+//       :err -> { eprintln("open failed") }
+//     }
+//
+// Path arguments are Lake `buf` values — they don't need to be
+// null-terminated by the caller; each helper appends the trailing
+// `\0` itself before handing the bytes to the kernel.
+//
+// Error convention (matches `rt_allocate`):
+//   {:ok n}     — n is the kernel return value (fd, bytes-read, 0
+//                 for mkdir/close).
+//   {:err code} — code is the positive errno (e.g. 2 = ENOENT,
+//                 13 = EACCES, 17 = EEXIST).
+
++std.experimental.sys.{ SYS_READ SYS_WRITE SYS_OPEN SYS_CLOSE SYS_MKDIR }
++std.process.{ alloc_or_die }
++std.bytes.{ set addr size }
+
+@rt(rt_syscall)
+@rt(rt_copy_bytes)
+@rt(rt_str_ptr)
+@rt(len)
+
+// Common open(2) flag combos (assembled from sys's individual
+// O_* constants — Lake doesn't yet support compile-time
+// `|`-evaluation of const decls, so we encode the combined values
+// directly).
+pub const O_WR_CREATE = 577     // O_WRONLY (1) | O_CREAT (64) | O_TRUNC (512)
+
+// Common file modes — Lake also lacks octal literals, so these
+// are decimal forms of 0o755 / 0o644.
+pub const MODE_755 = 493
+pub const MODE_644 = 420
+
+// ── helpers ──────────────────────────────────────────────────────
+
+// Allocate a `(buf_len(p) + 1)`-byte buffer, copy `p`, then write
+// a trailing 0 — yielding a null-terminated cstring suitable for
+// any path argument of a Linux syscall.  Public so the experimental
+// `process` module can reuse it when building exec's argv array.
+//
+// `pin set(...)` is critical: even though `std.bytes.set` is
+// ret-typed, a bare statement call goes through the async spawn
+// path (`pin` is the explicit sync-let sugar — see #39).  Without
+// it the null terminator would land *after* `ret c` returns, and
+// downstream `execve` / `open` calls would walk past the path's
+// real end into uninitialised memory and SIGSEGV.
+pub cstr_of is {
+  p buf -> ret buf {
+    let n = size(p)
+    let c = alloc_or_die(n + 1)
+    rt_copy_bytes(c 0 p 0 n)
+    pin set(c n 0)
+    ret c
+  }
+}
+
+// Wrap a raw kernel return value as `{:ok value}` / `{:err errno}`.
+wrap_result is {
+  r i64 -> ret {atom i64} {
+    when r < 0 {
+      true  -> { ret { :err 0 - r } }
+      false -> { ret { :ok r } }
+    }
+  }
+}
+
+// ── operations ───────────────────────────────────────────────────
+
+// open(path, flags, mode) — returns fd or errno.  `mode` is only
+// honoured when O_CREAT is set in `flags`; pass 0 otherwise.
+pub open is {
+  path buf flags i64 mode i64 -> ret {atom i64} {
+    let c = cstr_of(path)
+    let r = rt_syscall(SYS_OPEN addr(c) flags mode 0 0 0)
+    ret wrap_result(r)
+  }
+}
+
+// read(fd, dst, n) — into `dst` starting at offset 0.  Caller is
+// responsible for ensuring `dst` has at least `n` bytes of capacity.
+// Returns 0 on EOF, positive bytes-read otherwise.
+pub read is {
+  fd i64 dst buf n i64 -> ret {atom i64} {
+    let r = rt_syscall(SYS_READ fd addr(dst) n 0 0 0)
+    ret wrap_result(r)
+  }
+}
+
+// close(fd) — frees the file descriptor.  Returns `{:ok 0}` on
+// success; the kernel rarely reports close errors but they are
+// surfaced as `{:err errno}` for callers that care.
+pub close is {
+  fd i64 -> ret {atom i64} {
+    let r = rt_syscall(SYS_CLOSE fd 0 0 0 0 0)
+    ret wrap_result(r)
+  }
+}
+
+// mkdir(path, mode) — creates a single directory.  Treat
+// `{:err 17}` (EEXIST) as success when implementing "ensure
+// directory" semantics.
+pub mkdir is {
+  path buf mode i64 -> ret {atom i64} {
+    let c = cstr_of(path)
+    let r = rt_syscall(SYS_MKDIR addr(c) mode 0 0 0 0)
+    ret wrap_result(r)
+  }
+}
+
+// create(path, mode) — open `path` for writing, creating it if
+// missing and truncating if it already exists.  Bundles the
+// `O_WRONLY | O_CREAT | O_TRUNC` flag combo so callers don't
+// re-encode it.  Returns `{:ok fd}` or `{:err errno}`.
+pub create is {
+  path buf mode i64 -> ret {atom i64} {
+    let c = cstr_of(path)
+    let r = rt_syscall(SYS_OPEN addr(c) O_WR_CREATE mode 0 0 0)
+    ret wrap_result(r)
+  }
+}
+
+// write(fd, src, n) — kernel write syscall, no io_uring.  Caller
+// supplies `n` explicitly to allow partial writes from a buf that
+// may carry trailing bytes beyond the meaningful payload.
+pub write is {
+  fd i64 src buf n i64 -> ret {atom i64} {
+    let r = rt_syscall(SYS_WRITE fd addr(src) n 0 0 0)
+    ret wrap_result(r)
+  }
+}
+
+// write_str(fd, s) — convenience for str literals.  `rt_str_ptr`
+// + `len` give us the raw byte span; the type system distinguishes
+// str from buf (#45) so we can't route through the `write` buf
+// helper without an extra copy.
+pub write_str is {
+  fd i64 s str -> ret {atom i64} {
+    let r = rt_syscall(SYS_WRITE fd rt_str_ptr(s) len(s) 0 0 0)
+    ret wrap_result(r)
+  }
+}

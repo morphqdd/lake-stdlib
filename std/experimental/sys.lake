@@ -26,6 +26,18 @@ pub const SYS_MMAP      = 9
 pub const SYS_BRK       = 12
 pub const SYS_GETPID    = 39
 pub const SYS_EXIT      = 60
+pub const SYS_MKDIR     = 83
+pub const SYS_FORK      = 57
+pub const SYS_EXECVE    = 59
+pub const SYS_WAIT4     = 61
+
+// open(2) flags (asm-generic/fcntl.h).  Only the common subset:
+pub const O_RDONLY      = 0
+pub const O_WRONLY      = 1
+pub const O_RDWR        = 2
+pub const O_CREAT       = 64
+pub const O_TRUNC       = 512
+pub const O_APPEND      = 1024
 
 // File descriptors that ship with every process.
 pub const FD_STDIN      = 0
@@ -33,14 +45,10 @@ pub const FD_STDOUT     = 1
 pub const FD_STDERR     = 2
 
 // ── thin wrappers ───────────────────────────────────────────────
-
-// Terminate the current process with `code`.  Returns nothing
-// because the kernel never returns from `exit`.
-pub exit is {
-  code i64 -> {
-    rt_syscall(SYS_EXIT code 0 0 0 0 0)
-  }
-}
+//
+// Global process exit lives in `std.sys.exit` — re-defining one
+// here would collide on the unqualified `exit` symbol under
+// Lake's current flat name table (#72, #102).
 
 // Return the kernel-assigned pid of the current process.  Useful
 // for debug logging; not the same as Lake's actor pid.

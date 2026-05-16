@@ -1,0 +1,117 @@
+// Direct-syscall process management — fork / execve / wait4.
+//
+// This module sits at the lowest possible level: it manipulates raw
+// kernel handles without any of the Lake scheduler's bookkeeping.
+// Use it to invoke external programs (`lakec`, `git`, …) from a
+// Lake actor; do NOT use it to spawn child Lake actors — that's
+// what the regular `spawn` keyword is for.
+//
+// After `fork()` the child process inherits a *copy* of the parent's
+// scheduler / io_uring state, but ignoring it is safe because we
+// immediately call `execve` to replace the address space.  If the
+// `execve` itself fails the child exits via raw `SYS_EXIT` so it
+// never returns into Lake actor code.
+
++std.experimental.sys.{ SYS_FORK SYS_EXECVE SYS_WAIT4 SYS_EXIT }
++std.experimental.fs.{ cstr_of }
++std.process.{ alloc_or_die }
++std.bytes.{ addr }
+
+@rt(rt_syscall)
+@rt(rt_store)
+@rt(rt_load_u64)
+@rt(rt_envp_raw)
+
+// Build a 3-slot NULL-terminated `char**` array (two cstr pointers
+// + terminating zero) for execve.
+build_argv_2 is {
+  p0 i64 p1 i64 -> ret buf {
+    let av = alloc_or_die(24)
+    rt_store(av p0 8 0)
+    rt_store(av p1 8 8)
+    rt_store(av 0  8 16)
+    ret av
+  }
+}
+
+// `rt_envp_raw` returns the kernel-supplied `envp` pointer that
+// the asm shim snapshotted at `_start`.  Passing it directly to
+// execve makes the child inherit the parent's full environment
+// (PATH, LAKE_PATH, etc.).  We deliberately do NOT copy it — the
+// kernel-provided block stays mapped for the process lifetime, so
+// the raw pointer is stable through fork/execve.
+
+// Non-blocking wait on a child pid.  Loops via `self(pid)` until
+// `wait4(... WNOHANG)` reports the child has exited; each iteration
+// yields a quantum so the scheduler keeps polling io_uring and
+// running other actors.  Returns `{:ok exit_code}` on clean exit,
+// `{:err errno}` if wait4 itself fails.
+//
+// See #99 — should be rewritten on top of pidfd_open + io_uring
+// POLL so the actor truly parks instead of busy-syscalling.
+wait_poll is {
+  pid i64 -> ret {atom i64} {
+    let status = alloc_or_die(8)
+    // WNOHANG = 1.  Kernel returns 0 if no child changed state;
+    // returns `pid` and fills `status` once the child exits.
+    let r = rt_syscall(SYS_WAIT4 pid addr(status) 1 0 0 0)
+    when r < 0 {
+      true  -> { ret { :err 0 - r } }
+      false -> {
+        when r == 0 {
+          true  -> { self(pid) }
+          false -> {
+            let raw = rt_load_u64(status 0)
+            ret { :ok raw >> 8 & 0xff }
+          }
+        }
+      }
+    }
+  }
+}
+
+// Run `prog` with a single argv entry `a1` (so the child sees
+// argv = [prog, a1]).  Returns `{:ok exit_code}` on a clean wait,
+// `{:err errno}` if fork or wait4 themselves failed.  An execve
+// failure in the child surfaces as `{:ok 127}` (the conventional
+// "command not found" exit status).
+//
+// The wait4 logic is inlined deliberately: factoring it into a
+// helper ret-machine and calling that as `ret wait_helper(pid)`
+// trips bug #98 (lowering drops the outer machine when a nested
+// when-arm's tail is a ret-machine call).  Inline keeps everything
+// on one ret-machine chain.
+//
+// Concurrency note: the wait4 here uses WNOHANG so the kernel does
+// NOT block the calling thread.  The parent actor self-loops while
+// the child is still running, yielding a quantum every iteration —
+// scheduler keeps polling I/O and running other actors.  This is a
+// stop-gap; #99 replaces the spin with pidfd+io_uring POLL so the
+// actor truly parks instead of burning one syscall per quantum.
+pub run is {
+  prog buf a1 buf -> ret {atom i64} {
+    let pc = cstr_of(prog)
+    let c1 = cstr_of(a1)
+    let av = build_argv_2(addr(pc) addr(c1))
+    let ev = rt_envp_raw()
+    let pid = rt_syscall(SYS_FORK 0 0 0 0 0 0)
+    when pid < 0 {
+      true  -> { ret { :err 0 - pid } }
+      false -> {
+        when pid == 0 {
+          true  -> {
+            // `ev` is already a raw `char**` pointer from the asm
+            // shim — no `addr()` wrap needed.
+            rt_syscall(SYS_EXECVE addr(pc) addr(av) ev 0 0 0)
+            rt_syscall(SYS_EXIT 127 0 0 0 0 0)
+            ret { :err 127 }
+          }
+          false -> {
+            let result = wait_poll(pid)
+            ret result
+          }
+        }
+      }
+    }
+  }
+}

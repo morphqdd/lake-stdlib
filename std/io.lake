@@ -18,6 +18,8 @@
 // The sync path costs one mailbox roundtrip per call (~µs on the
 // current scheduler); the async path is the cheap default.
 
++std.bytes.{ size }
+
 @rt(rt_write)
 @rt(len)
 
@@ -47,6 +49,27 @@ pub eprintln is {
   s str -> ret i64 {
     rt_write(2 s len(s))
     rt_write(2 "\n" 1)
+    ret 0
+  }
+}
+
+// ── buf-valued variants ────────────────────────────────────────
+//
+// `print`/`println` take a `str` (compile-time literal or
+// `concat*` output).  Runtime byte buffers (`argv` entries, file
+// reads) come back as `buf`; these helpers cover that path.
+
+pub print_buf is {
+  b buf -> ret i64 {
+    rt_write(1 b size(b))
+    ret 0
+  }
+}
+
+pub println_buf is {
+  b buf -> ret i64 {
+    rt_write(1 b size(b))
+    rt_write(1 "\n" 1)
     ret 0
   }
 }

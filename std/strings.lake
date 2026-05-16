@@ -19,10 +19,47 @@
 // `std/experimental/strings.lake`.
 
 +std.process.{ die }
++std.bytes.{ size trim }
 
 @rt(rt_allocate)
 @rt(rt_copy_bytes)
 @rt(len)
+@rt(cmp_str_buf)
+
+// `eq_buf(s, b)` — 1 iff the `str` literal `s` is byte-for-byte
+// identical to the `buf` `b`.  Lake distinguishes `str` from `buf`
+// in the type system (#45); this helper bridges the two for argv
+// matches against compile-time command names without any
+// allocation (the rt-fn walks the two fat-pointers in place).
+pub eq_buf is {
+  s str b buf -> ret i64 { ret cmp_str_buf(s b) }
+}
+
+// `concat_buf(a, b)` — concatenate a runtime `buf` with a
+// compile-time `str` literal.  The common "append literal suffix
+// to a runtime path" pattern (e.g. `concat_buf(name "/src")`).
+// Returns a fresh buf trimmed to `size(a) + len(b)`.
+pub concat_buf is {
+  a buf b str -> ret buf {
+    let la = size(a)
+    let lb = len(b)
+    let total = la + lb
+    let r = rt_allocate(total)
+    when r.0 {
+      :ok -> {
+        let dst = r.1
+        rt_copy_bytes(dst 0  a 0 la)
+        rt_copy_bytes(dst la b 0 lb)
+        let _t = trim(dst total)
+        ret dst
+      }
+      _ -> {
+        die()
+        ret r.1
+      }
+    }
+  }
+}
 
 // Concatenate two strings.  Result length = len(a) + len(b).
 pub concat is {
