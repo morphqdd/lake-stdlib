@@ -34,6 +34,18 @@ build_argv_2 is {
   }
 }
 
+// 4-slot variant for 3-argv programs (`prog a1 a2`).
+build_argv_3 is {
+  p0 i64 p1 i64 p2 i64 -> ret buf {
+    let av = alloc_or_die(32)
+    rt_store(av p0 8 0)
+    rt_store(av p1 8 8)
+    rt_store(av p2 8 16)
+    rt_store(av 0  8 24)
+    ret av
+  }
+}
+
 // `rt_envp_raw` returns the kernel-supplied `envp` pointer that
 // the asm shim snapshotted at `_start`.  Passing it directly to
 // execve makes the child inherit the parent's full environment
@@ -103,6 +115,65 @@ pub run is {
             // `ev` is already a raw `char**` pointer from the asm
             // shim — no `addr()` wrap needed.
             rt_syscall(SYS_EXECVE addr(pc) addr(av) ev 0 0 0)
+            rt_syscall(SYS_EXIT 127 0 0 0 0 0)
+            ret { :err 127 }
+          }
+          false -> {
+            let result = wait_poll(pid)
+            ret result
+          }
+        }
+      }
+    }
+  }
+}
+
+// 3-argv variant of `run` — `argv = [prog, a1, a2]`.  Used for
+// shell invocations (`/bin/sh -c CMD`) and any program that needs
+// more than one positional arg.  Inherits envp from the parent.
+pub run3 is {
+  prog buf a1 buf a2 buf -> ret {atom i64} {
+    let pc = cstr_of(prog)
+    let c1 = cstr_of(a1)
+    let c2 = cstr_of(a2)
+    let av = build_argv_3(addr(pc) addr(c1) addr(c2))
+    let ev = rt_envp_raw()
+    let pid = rt_syscall(SYS_FORK 0 0 0 0 0 0)
+    when pid < 0 {
+      true  -> { ret { :err 0 - pid } }
+      false -> {
+        when pid == 0 {
+          true  -> {
+            rt_syscall(SYS_EXECVE addr(pc) addr(av) ev 0 0 0)
+            rt_syscall(SYS_EXIT 127 0 0 0 0 0)
+            ret { :err 127 }
+          }
+          false -> {
+            let result = wait_poll(pid)
+            ret result
+          }
+        }
+      }
+    }
+  }
+}
+
+// Same as `run` but with caller-supplied envp.  `envp_ptr` is a
+// raw `char**` (i64 pointer to a NULL-terminated array of cstring
+// pointers).  Callers build it with `rt_store` over a fresh buf;
+// see lake-house's `cmd/build.lake` for the canonical assembly.
+pub run_envp is {
+  prog buf a1 buf envp_ptr i64 -> ret {atom i64} {
+    let pc = cstr_of(prog)
+    let c1 = cstr_of(a1)
+    let av = build_argv_2(addr(pc) addr(c1))
+    let pid = rt_syscall(SYS_FORK 0 0 0 0 0 0)
+    when pid < 0 {
+      true  -> { ret { :err 0 - pid } }
+      false -> {
+        when pid == 0 {
+          true  -> {
+            rt_syscall(SYS_EXECVE addr(pc) addr(av) envp_ptr 0 0 0)
             rt_syscall(SYS_EXIT 127 0 0 0 0 0)
             ret { :err 127 }
           }

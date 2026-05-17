@@ -101,7 +101,7 @@ pub read is {
 // close(fd) — frees the file descriptor.  Returns `{:ok 0}` on
 // success; the kernel rarely reports close errors but they are
 // surfaced as `{:err errno}` for callers that care.
-pub close is {
+pub close_file is {
   fd i64 -> ret {atom i64} {
     let r = rt_syscall(SYS_CLOSE fd 0 0 0 0 0)
     ret wrap_result(r)
