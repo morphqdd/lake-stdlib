@@ -1,0 +1,55 @@
+// lash — Lake's argv parser.  Phase 1.
+//
+// See docs/state/features/108_lash_phase1_argv.md for the spec.
+//
+// Schema buf layout (all offsets in bytes; one big 4 KB buf):
+//
+//   header (24 bytes):
+//     0   flag_count i64
+//     8   opt_count  i64
+//     16  pos_count  i64
+//
+//   flag slots — 32 slots × 40 bytes (base 24, end 1304):
+//     +0   name_len   i64
+//     +8   short_char i64   (0 if no short)
+//     +16  seen       i64
+//     +24  name bytes (16 inline)
+//
+//   opt slots — 32 slots × 56 bytes (base 1304, end 3096):
+//     +0   name_len   i64
+//     +8   short_char i64
+//     +16  present    i64
+//     +24  value_ptr  i64   (raw cstr ptr into argv data)
+//     +32  name bytes (24 inline)
+//
+//   pos slots — 16 slots × 40 bytes (base 3096, end 3736):
+//     +0   name_len   i64
+//     +8   value_ptr  i64   (raw cstr ptr into argv data)
+//     +16  present    i64
+//     +24  name bytes (16 inline)
+//
+// Name comparison: schema is a `buf`, argv values come from
+// `std.env.argv_at` as `buf`s.  Names stored inline so the byte
+// compare walks the schema buf directly via `buf[off]`.
+//
+// Option values: stored as raw cstr pointers (kernel-supplied argv
+// strings are null-terminated, and for `--name=value` we point past
+// the `=` — still a valid cstr).  `get_opt` materialises a fresh
+// Lake `buf` via `rt_cstr_to_buf`.
+//
+// #124: cross-module inlining of pub helpers doesn't carry module-
+// local consts.  We use raw numeric literals throughout.
+
++std.process.{ alloc_or_die }
+
+// ── parser() ────────────────────────────────────────────────────
+// Fresh schema buf.  4 KB covers 32 flags + 32 opts + 16
+// positionals with all counters zeroed (rt_allocate hands back
+// zeroed memory).
+
+pub parser is {
+  _ -> ret buf {
+    let p = alloc_or_die(4096)
+    ret p
+  }
+}
