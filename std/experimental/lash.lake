@@ -42,6 +42,12 @@
 
 +std.process.{ alloc_or_die }
 
+@rt(rt_copy_bytes)
+@rt(rt_store)
+@rt(rt_load_u8)
+@rt(rt_load_u64)
+@rt(len)
+
 // ── parser() ────────────────────────────────────────────────────
 // Fresh schema buf.  4 KB covers 32 flags + 32 opts + 16
 // positionals with all counters zeroed (rt_allocate hands back
@@ -51,5 +57,93 @@ pub parser is {
   _ -> ret buf {
     let p = alloc_or_die(4096)
     ret p
+  }
+}
+
+// ── schema builders ─────────────────────────────────────────────
+//
+// Name bytes are written inline into the slot via rt_copy_bytes.
+// `str`/`buf` are interchangeable at the rt-call ABI (typeck rule
+// in `lake-frontend/src/typeck/mod.rs`), so passing the str literal
+// directly works.
+
+pub flag is {
+  p buf long str short str -> ret buf {
+    let n = rt_load_u64(p 0)
+    let slot = 24 + n * 40
+    let nl = len(long)
+    let sc = short_char_of(short)
+    rt_store(p nl 8 slot)
+    rt_store(p sc 8 slot + 8)
+    rt_store(p 0  8 slot + 16)
+    rt_copy_bytes(p slot + 24 long 0 nl)
+    rt_store(p n + 1 8 0)
+    ret p
+  }
+}
+
+pub opt is {
+  p buf long str short str -> ret buf {
+    let n = rt_load_u64(p 8)
+    let slot = 1304 + n * 56
+    let nl = len(long)
+    let sc = short_char_of(short)
+    rt_store(p nl 8 slot)
+    rt_store(p sc 8 slot + 8)
+    rt_store(p 0  8 slot + 16)
+    rt_store(p 0  8 slot + 24)
+    rt_copy_bytes(p slot + 32 long 0 nl)
+    rt_store(p n + 1 8 8)
+    ret p
+  }
+}
+
+pub positional is {
+  p buf name str -> ret buf {
+    let n = rt_load_u64(p 16)
+    let slot = 3096 + n * 40
+    let nl = len(name)
+    rt_store(p nl 8 slot)
+    rt_store(p 0  8 slot + 8)
+    rt_store(p 0  8 slot + 16)
+    rt_copy_bytes(p slot + 24 name 0 nl)
+    rt_store(p n + 1 8 16)
+    ret p
+  }
+}
+
+// Extract the first byte of a short-name str (or 0 if empty).
+// Short names are typically 1 char; we ignore any extras.
+short_char_of is {
+  s str -> ret i64 {
+    let l = len(s)
+    when l == 0 {
+      true  -> { ret 0 }
+      false -> {
+        let b = alloc_or_die(l)
+        rt_copy_bytes(b 0 s 0 l)
+        ret b[0]
+      }
+    }
+  }
+}
+
+// ── byte-level compare helpers ──────────────────────────────────
+//
+// Two flavours of byte-walk: buf↔buf for argv matching during
+// parse, buf↔str for the public getter path.  rt_load_u8 accepts
+// both shapes via the str/buf ABI overlap.
+
+bytes_eq is {
+  a buf ao i64 b buf bo i64 i i64 n i64 -> ret i64 {
+    when i == n {
+      true -> { ret 1 }
+      _    -> {
+        when a[ao + i] == b[bo + i] {
+          true -> { self(a ao b bo i + 1 n) }
+          _    -> { ret 0 }
+        }
+      }
+    }
   }
 }
