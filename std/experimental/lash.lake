@@ -40,12 +40,17 @@
 // #124: cross-module inlining of pub helpers doesn't carry module-
 // local consts.  We use raw numeric literals throughout.
 
++std.env.{ argc argv_at }
++std.bytes.{ size }
 +std.process.{ alloc_or_die }
 
 @rt(rt_copy_bytes)
 @rt(rt_store)
 @rt(rt_load_u8)
 @rt(rt_load_u64)
+@rt(rt_argv_raw)
+@rt(rt_load_ptr_raw)
+@rt(rt_cstr_to_buf)
 @rt(len)
 
 // ── parser() ────────────────────────────────────────────────────
@@ -142,6 +147,530 @@ bytes_eq is {
         when a[ao + i] == b[bo + i] {
           true -> { self(a ao b bo i + 1 n) }
           _    -> { ret 0 }
+        }
+      }
+    }
+  }
+}
+
+bytes_eq_str is {
+  a buf ao i64 b str bo i64 i i64 n i64 -> ret i64 {
+    when i == n {
+      true -> { ret 1 }
+      _    -> {
+        let av = a[ao + i]
+        let bv = rt_load_u8(b bo + i)
+        when av == bv {
+          true -> { self(a ao b bo i + 1 n) }
+          _    -> { ret 0 }
+        }
+      }
+    }
+  }
+}
+
+// ── name matching ───────────────────────────────────────────────
+//
+// Compare the inline name bytes at `slot_off + name_off` (length at
+// `slot_off`'s name_len cell) against `arg`'s slice `[a_off, a_off
+// + a_len)`.  Returns 1 on equal-bytes, 0 otherwise.
+
+name_eq is {
+  p buf slot_off i64 name_off i64 arg buf a_off i64 a_len i64 -> ret i64 {
+    let nl = rt_load_u64(p slot_off)
+    when nl == a_len {
+      true  -> { ret bytes_eq(p slot_off + name_off arg a_off 0 nl) }
+      false -> { ret 0 }
+    }
+  }
+}
+
+// ── argv-derived helpers ────────────────────────────────────────
+//
+// argv[i]'s raw cstr pointer.  Kernel-supplied, null-terminated,
+// valid for the lifetime of the process.
+
+argv_cstr is {
+  i i64 -> ret i64 {
+    let base = rt_argv_raw()
+    ret rt_load_ptr_raw(base i)
+  }
+}
+
+// Find the first byte equal to `target` in `arg[0..n]`.  Returns
+// -1 if not found.  Used to split `--name=value` at `=`.
+
+find_byte is {
+  arg buf i i64 n i64 target i64 -> ret i64 {
+    when i == n {
+      true -> { ret 0 - 1 }
+      _    -> {
+        when arg[i] == target {
+          true -> { ret i }
+          _    -> { self(arg i + 1 n target) }
+        }
+      }
+    }
+  }
+}
+
+// ── slot lookup ─────────────────────────────────────────────────
+
+find_flag_long is {
+  p buf k i64 n i64 arg buf a_off i64 a_len i64 -> ret i64 {
+    when k == n {
+      true -> { ret 0 - 1 }
+      _    -> {
+        let slot = 24 + k * 40
+        when name_eq(p slot 24 arg a_off a_len) {
+          1 -> { ret k }
+          _ -> { self(p k + 1 n arg a_off a_len) }
+        }
+      }
+    }
+  }
+}
+
+find_opt_long is {
+  p buf k i64 n i64 arg buf a_off i64 a_len i64 -> ret i64 {
+    when k == n {
+      true -> { ret 0 - 1 }
+      _    -> {
+        let slot = 1304 + k * 56
+        when name_eq(p slot 32 arg a_off a_len) {
+          1 -> { ret k }
+          _ -> { self(p k + 1 n arg a_off a_len) }
+        }
+      }
+    }
+  }
+}
+
+find_flag_short is {
+  p buf k i64 n i64 c i64 -> ret i64 {
+    when k == n {
+      true -> { ret 0 - 1 }
+      _    -> {
+        let slot = 24 + k * 40
+        let sc = rt_load_u64(p slot + 8)
+        when sc == c {
+          true -> {
+            when sc == 0 {
+              true -> { self(p k + 1 n c) }
+              _    -> { ret k }
+            }
+          }
+          _ -> { self(p k + 1 n c) }
+        }
+      }
+    }
+  }
+}
+
+find_opt_short is {
+  p buf k i64 n i64 c i64 -> ret i64 {
+    when k == n {
+      true -> { ret 0 - 1 }
+      _    -> {
+        let slot = 1304 + k * 56
+        let sc = rt_load_u64(p slot + 8)
+        when sc == c {
+          true -> {
+            when sc == 0 {
+              true -> { self(p k + 1 n c) }
+              _    -> { ret k }
+            }
+          }
+          _ -> { self(p k + 1 n c) }
+        }
+      }
+    }
+  }
+}
+
+// ── error helpers ───────────────────────────────────────────────
+//
+// Build a `{:err msg_buf}` tuple.  Phase 1 keeps messages simple
+// (no concat); each call-site picks the static string.
+
+mk_err is {
+  s str -> ret {atom buf} {
+    let l = len(s)
+    let b = alloc_or_die(l)
+    rt_copy_bytes(b 0 s 0 l)
+    ret { :err b }
+  }
+}
+
+// ── positional assignment ──────────────────────────────────────
+//
+// Walk pos slots looking for the first unfilled one; store the
+// argv cstr pointer.  If all slots are full we silently drop the
+// extra positional (Phase 1 doesn't error on overflow — the
+// caller's `get_positional` ladder defines the expected count).
+
+store_positional is {
+  p buf k i64 n i64 cstr_ptr i64 -> ret i64 {
+    when k == n {
+      true -> { ret 0 }
+      _    -> {
+        let slot = 3096 + k * 40
+        let present = rt_load_u64(p slot + 16)
+        when present == 0 {
+          true -> {
+            rt_store(p cstr_ptr 8 slot + 8)
+            rt_store(p 1        8 slot + 16)
+            ret 0
+          }
+          _ -> { self(p k + 1 n cstr_ptr) }
+        }
+      }
+    }
+  }
+}
+
+// ── bundled short walker ───────────────────────────────────────
+//
+// `-xyz` — each char must be a registered flag, no opts allowed.
+// Returns 1 on success, 0 if any char is unknown.
+
+walk_bundled is {
+  p buf arg buf i i64 n i64 nflags i64 nopts i64 -> ret i64 {
+    when i == n {
+      true -> { ret 1 }
+      _    -> {
+        let c = arg[i]
+        let f = find_flag_short(p 0 nflags c)
+        when f < 0 {
+          true -> { ret 0 }
+          _    -> {
+            let slot = 24 + f * 40
+            rt_store(p 1 8 slot + 16)
+            self(p arg i + 1 n nflags nopts)
+          }
+        }
+      }
+    }
+  }
+}
+
+// ── parse driver ────────────────────────────────────────────────
+//
+// Tail-recursive walker over argv positions.  `mode` is 0 normally,
+// 1 after `--` (everything remaining is positional).  Caller starts
+// at i=1 to skip argv[0] (program name).
+
+parse_loop is {
+  p buf i i64 n i64 mode i64 -> ret {atom buf} {
+    when i == n {
+      true -> { ret { :ok p } }
+      _    -> {
+        let r = argv_at(i)
+        when r.0 {
+          :ok -> {
+            let arg = r.1
+            let sz = size(arg)
+            when mode == 1 {
+              true -> {
+                pin store_positional(p 0 16 argv_cstr(i))
+                self(p i + 1 n 1)
+              }
+              _ -> { ret parse_one(p i n arg sz) }
+            }
+          }
+          _ -> { ret { :ok p } }
+        }
+      }
+    }
+  }
+}
+
+// Single-step dispatch: classify `arg` and update state, then
+// tail-call back into `parse_loop`.
+parse_one is {
+  p buf i i64 n i64 arg buf sz i64 -> ret {atom buf} {
+    when sz >= 2 {
+      true -> {
+        let c0 = arg[0]
+        when c0 == 45 {
+          true -> { ret parse_dash(p i n arg sz) }
+          _    -> {
+            pin store_positional(p 0 16 argv_cstr(i))
+            ret parse_loop(p i + 1 n 0)
+          }
+        }
+      }
+      _ -> {
+        pin store_positional(p 0 16 argv_cstr(i))
+        ret parse_loop(p i + 1 n 0)
+      }
+    }
+  }
+}
+
+// `arg` starts with `-`.  Three subcases: `--` terminator, `--long`,
+// or `-short(s)`.
+parse_dash is {
+  p buf i i64 n i64 arg buf sz i64 -> ret {atom buf} {
+    let c1 = arg[1]
+    when c1 == 45 {
+      true -> {
+        when sz == 2 {
+          true -> { ret parse_loop(p i + 1 n 1) }
+          _    -> { ret parse_long(p i n arg sz) }
+        }
+      }
+      _ -> { ret parse_short(p i n arg sz) }
+    }
+  }
+}
+
+// `--long` or `--long=value`.
+parse_long is {
+  p buf i i64 n i64 arg buf sz i64 -> ret {atom buf} {
+    let eq = find_byte(arg 2 sz 61)
+    let nflags = rt_load_u64(p 0)
+    let nopts = rt_load_u64(p 8)
+    when eq < 0 {
+      true -> {
+        // `--long` form.
+        let name_len = sz - 2
+        let f = find_flag_long(p 0 nflags arg 2 name_len)
+        when f < 0 {
+          true -> {
+            let o = find_opt_long(p 0 nopts arg 2 name_len)
+            when o < 0 {
+              true -> { ret mk_err("lash: unknown option") }
+              _    -> {
+                when i + 1 == n {
+                  true -> { ret mk_err("lash: option requires a value") }
+                  _    -> {
+                    let slot = 1304 + o * 56
+                    rt_store(p 1                8 slot + 16)
+                    rt_store(p argv_cstr(i + 1) 8 slot + 24)
+                    ret parse_loop(p i + 2 n 0)
+                  }
+                }
+              }
+            }
+          }
+          _ -> {
+            let slot = 24 + f * 40
+            rt_store(p 1 8 slot + 16)
+            ret parse_loop(p i + 1 n 0)
+          }
+        }
+      }
+      _ -> {
+        // `--long=value` — name is arg[2..eq], value cstr ptr is
+        // argv_cstr(i) + eq + 1.
+        let name_len = eq - 2
+        let o = find_opt_long(p 0 nopts arg 2 name_len)
+        when o < 0 {
+          true -> {
+            let f = find_flag_long(p 0 nflags arg 2 name_len)
+            when f < 0 {
+              true -> { ret mk_err("lash: unknown option") }
+              _    -> { ret mk_err("lash: flag takes no value") }
+            }
+          }
+          _ -> {
+            let slot = 1304 + o * 56
+            let cstr = argv_cstr(i) + eq + 1
+            rt_store(p 1    8 slot + 16)
+            rt_store(p cstr 8 slot + 24)
+            ret parse_loop(p i + 1 n 0)
+          }
+        }
+      }
+    }
+  }
+}
+
+// `-x` or `-x value` or `-xyz`.
+parse_short is {
+  p buf i i64 n i64 arg buf sz i64 -> ret {atom buf} {
+    let nflags = rt_load_u64(p 0)
+    let nopts = rt_load_u64(p 8)
+    when sz == 2 {
+      true -> {
+        let c = arg[1]
+        let f = find_flag_short(p 0 nflags c)
+        when f < 0 {
+          true -> {
+            let o = find_opt_short(p 0 nopts c)
+            when o < 0 {
+              true -> { ret mk_err("lash: unknown short option") }
+              _    -> {
+                when i + 1 == n {
+                  true -> { ret mk_err("lash: option requires a value") }
+                  _    -> {
+                    let slot = 1304 + o * 56
+                    rt_store(p 1                8 slot + 16)
+                    rt_store(p argv_cstr(i + 1) 8 slot + 24)
+                    ret parse_loop(p i + 2 n 0)
+                  }
+                }
+              }
+            }
+          }
+          _ -> {
+            let slot = 24 + f * 40
+            rt_store(p 1 8 slot + 16)
+            ret parse_loop(p i + 1 n 0)
+          }
+        }
+      }
+      _ -> {
+        // Bundled `-xyz` — each char must be a flag.
+        let ok = walk_bundled(p arg 1 sz nflags nopts)
+        when ok {
+          1 -> { ret parse_loop(p i + 1 n 0) }
+          _ -> { ret mk_err("lash: unknown short option in bundle") }
+        }
+      }
+    }
+  }
+}
+
+// ── public parse entry ──────────────────────────────────────────
+
+pub parse is {
+  p buf -> ret {atom buf} {
+    let n = argc()
+    ret parse_loop(p 1 n 0)
+  }
+}
+
+// ── getters ─────────────────────────────────────────────────────
+//
+// All getters use raw literals (no module-local consts) per #124.
+
+pub get_flag is {
+  p buf name str -> ret i64 {
+    let nflags = rt_load_u64(p 0)
+    let nl = len(name)
+    let k = find_flag_by_str(p 0 nflags name nl)
+    when k < 0 {
+      true -> { ret 0 }
+      _    -> {
+        let slot = 24 + k * 40
+        ret rt_load_u64(p slot + 16)
+      }
+    }
+  }
+}
+
+pub get_opt is {
+  p buf name str -> ret {atom buf} {
+    let nopts = rt_load_u64(p 8)
+    let nl = len(name)
+    let k = find_opt_by_str(p 0 nopts name nl)
+    when k < 0 {
+      true -> {
+        let e = alloc_or_die(0)
+        ret { :none e }
+      }
+      _ -> {
+        let slot = 1304 + k * 56
+        let present = rt_load_u64(p slot + 16)
+        when present {
+          1 -> {
+            let cstr = rt_load_u64(p slot + 24)
+            let cb = rt_cstr_to_buf(cstr)
+            when cb.0 {
+              :ok -> { ret { :some cb.1 } }
+              _   -> {
+                let e = alloc_or_die(0)
+                ret { :none e }
+              }
+            }
+          }
+          _ -> {
+            let e = alloc_or_die(0)
+            ret { :none e }
+          }
+        }
+      }
+    }
+  }
+}
+
+pub get_positional is {
+  p buf idx i64 -> ret {atom buf} {
+    let npos = rt_load_u64(p 16)
+    when idx >= npos {
+      true -> {
+        let e = alloc_or_die(0)
+        ret { :none e }
+      }
+      _ -> {
+        let slot = 3096 + idx * 40
+        let present = rt_load_u64(p slot + 16)
+        when present {
+          1 -> {
+            let cstr = rt_load_u64(p slot + 8)
+            let cb = rt_cstr_to_buf(cstr)
+            when cb.0 {
+              :ok -> { ret { :some cb.1 } }
+              _   -> {
+                let e = alloc_or_die(0)
+                ret { :none e }
+              }
+            }
+          }
+          _ -> {
+            let e = alloc_or_die(0)
+            ret { :none e }
+          }
+        }
+      }
+    }
+  }
+}
+
+// Name-by-str lookup used by the getters.  Walks the schema's flag /
+// opt tables, comparing each slot's inline name against the caller's
+// str literal byte-by-byte via `bytes_eq_str`.
+
+find_flag_by_str is {
+  p buf k i64 n i64 name str nl i64 -> ret i64 {
+    when k == n {
+      true -> { ret 0 - 1 }
+      _    -> {
+        let slot = 24 + k * 40
+        let sn = rt_load_u64(p slot)
+        when sn == nl {
+          true -> {
+            let eq = bytes_eq_str(p slot + 24 name 0 0 nl)
+            when eq {
+              1 -> { ret k }
+              _ -> { self(p k + 1 n name nl) }
+            }
+          }
+          _ -> { self(p k + 1 n name nl) }
+        }
+      }
+    }
+  }
+}
+
+find_opt_by_str is {
+  p buf k i64 n i64 name str nl i64 -> ret i64 {
+    when k == n {
+      true -> { ret 0 - 1 }
+      _    -> {
+        let slot = 1304 + k * 56
+        let sn = rt_load_u64(p slot)
+        when sn == nl {
+          true -> {
+            let eq = bytes_eq_str(p slot + 32 name 0 0 nl)
+            when eq {
+              1 -> { ret k }
+              _ -> { self(p k + 1 n name nl) }
+            }
+          }
+          _ -> { self(p k + 1 n name nl) }
         }
       }
     }
