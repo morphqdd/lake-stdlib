@@ -42,8 +42,8 @@
 
 +std.env.{ argc argv_at }
 +std.bytes.{ size }
-+std.process.{ alloc_or_die }
 
+@rt(rt_allocate)
 @rt(rt_copy_bytes)
 @rt(rt_store)
 @rt(rt_load_u8)
@@ -53,14 +53,24 @@
 @rt(rt_cstr_to_buf)
 @rt(len)
 
+// Inline-able allocator wrapper.  Single-Ret body so #78 phase 2a
+// folds it into callers; bypasses `alloc_or_die`'s non-simple body
+// (which has a `when` ladder and thus stays as a spawn+wait).
+lash_alloc is {
+  n i64 -> ret buf {
+    let r = rt_allocate(n)
+    ret r.1
+  }
+}
+
 // ── parser() ────────────────────────────────────────────────────
 // Fresh schema buf.  4 KB covers 32 flags + 32 opts + 16
 // positionals with all counters zeroed (rt_allocate hands back
 // zeroed memory).
 
 pub parser is {
-  _ -> ret buf {
-    let p = alloc_or_die(4096)
+  n i64 -> ret buf {
+    let p = lash_alloc(4096 + n - n)
     ret p
   }
 }
@@ -76,7 +86,7 @@ pub flag is {
   p buf long str short str -> ret buf {
     let n = rt_load_u64(p 0)
     let slot = 24 + n * 40
-    let nl = len(long)
+    let nl = size(long)
     let sc = short_char_of(short)
     rt_store(p nl 8 slot)
     rt_store(p sc 8 slot + 8)
@@ -91,7 +101,7 @@ pub opt is {
   p buf long str short str -> ret buf {
     let n = rt_load_u64(p 8)
     let slot = 1304 + n * 56
-    let nl = len(long)
+    let nl = size(long)
     let sc = short_char_of(short)
     rt_store(p nl 8 slot)
     rt_store(p sc 8 slot + 8)
@@ -107,7 +117,7 @@ pub positional is {
   p buf name str -> ret buf {
     let n = rt_load_u64(p 16)
     let slot = 3096 + n * 40
-    let nl = len(name)
+    let nl = size(name)
     rt_store(p nl 8 slot)
     rt_store(p 0  8 slot + 8)
     rt_store(p 0  8 slot + 16)
@@ -117,19 +127,12 @@ pub positional is {
   }
 }
 
-// Extract the first byte of a short-name str (or 0 if empty).
-// Short names are typically 1 char; we ignore any extras.
+// Extract the first byte of a short-name str.  Callers must pass a
+// non-empty literal (single-char short name); empty `""` is UB.
+// Body is a single rt-call so #78 phase 2a inlines it.
 short_char_of is {
   s str -> ret i64 {
-    let l = len(s)
-    when l == 0 {
-      true  -> { ret 0 }
-      false -> {
-        let b = alloc_or_die(l)
-        rt_copy_bytes(b 0 s 0 l)
-        ret b[0]
-      }
-    }
+    ret rt_load_u8(s 0)
   }
 }
 
@@ -222,7 +225,8 @@ find_flag_long is {
       true -> { ret 0 - 1 }
       _    -> {
         let slot = 24 + k * 40
-        when name_eq(p slot 24 arg a_off a_len) {
+        let hit = name_eq(p slot 24 arg a_off a_len)
+        when hit {
           1 -> { ret k }
           _ -> { self(p k + 1 n arg a_off a_len) }
         }
@@ -237,7 +241,8 @@ find_opt_long is {
       true -> { ret 0 - 1 }
       _    -> {
         let slot = 1304 + k * 56
-        when name_eq(p slot 32 arg a_off a_len) {
+        let hit = name_eq(p slot 32 arg a_off a_len)
+        when hit {
           1 -> { ret k }
           _ -> { self(p k + 1 n arg a_off a_len) }
         }
@@ -295,8 +300,8 @@ find_opt_short is {
 
 mk_err is {
   s str -> ret {atom buf} {
-    let l = len(s)
-    let b = alloc_or_die(l)
+    let l = size(s)
+    let b = lash_alloc(l)
     rt_copy_bytes(b 0 s 0 l)
     ret { :err b }
   }
@@ -549,7 +554,7 @@ pub parse is {
 pub get_flag is {
   p buf name str -> ret i64 {
     let nflags = rt_load_u64(p 0)
-    let nl = len(name)
+    let nl = size(name)
     let k = find_flag_by_str(p 0 nflags name nl)
     when k < 0 {
       true -> { ret 0 }
@@ -564,11 +569,11 @@ pub get_flag is {
 pub get_opt is {
   p buf name str -> ret {atom buf} {
     let nopts = rt_load_u64(p 8)
-    let nl = len(name)
+    let nl = size(name)
     let k = find_opt_by_str(p 0 nopts name nl)
     when k < 0 {
       true -> {
-        let e = alloc_or_die(0)
+        let e = lash_alloc(0)
         ret { :none e }
       }
       _ -> {
@@ -581,13 +586,13 @@ pub get_opt is {
             when cb.0 {
               :ok -> { ret { :some cb.1 } }
               _   -> {
-                let e = alloc_or_die(0)
+                let e = lash_alloc(0)
                 ret { :none e }
               }
             }
           }
           _ -> {
-            let e = alloc_or_die(0)
+            let e = lash_alloc(0)
             ret { :none e }
           }
         }
@@ -601,7 +606,7 @@ pub get_positional is {
     let npos = rt_load_u64(p 16)
     when idx >= npos {
       true -> {
-        let e = alloc_or_die(0)
+        let e = lash_alloc(0)
         ret { :none e }
       }
       _ -> {
@@ -614,13 +619,13 @@ pub get_positional is {
             when cb.0 {
               :ok -> { ret { :some cb.1 } }
               _   -> {
-                let e = alloc_or_die(0)
+                let e = lash_alloc(0)
                 ret { :none e }
               }
             }
           }
           _ -> {
-            let e = alloc_or_die(0)
+            let e = lash_alloc(0)
             ret { :none e }
           }
         }
