@@ -1,0 +1,27 @@
+// lash smoke fixture — Phase 1 schema builder.
+//
+// Phase 1 ships schema construction (`parser`, `flag`, `opt`,
+// `positional`) + getters on an unparsed schema.  The argv-driving
+// `parse` runtime path hits a compiler chain-depth limit (see
+// docs/state/bugs/128_buf_ret_chain_3deep.md) and is exercised in
+// Phase 2 once the underlying ret-machine wait dequeue is fixed.
+//
+// Build / run:
+//   LAKE_PATH=$(pwd) lakec examples/lash_smoke/main.lake
+//   ./examples/lash_smoke/build/main
+
++std.experimental.lash.{ parser flag opt positional get_flag }
++std.io.{ println }
+@rt(rt_exit)
+
+main is {
+  _ -> {
+    let p = parser(0)
+    let p = flag(p "verbose" "v")
+    let p = opt(p "name" "n")
+    let p = positional(p "input")
+    let v = get_flag(p "verbose")
+    pin println("schema built")
+    rt_exit(0)
+  }
+}

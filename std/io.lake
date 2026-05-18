@@ -73,3 +73,18 @@ pub println_buf is {
     ret 0
   }
 }
+
+pub eprint_buf is {
+  b buf -> ret i64 {
+    rt_write(2 b size(b))
+    ret 0
+  }
+}
+
+pub eprintln_buf is {
+  b buf -> ret i64 {
+    rt_write(2 b size(b))
+    rt_write(2 "\n" 1)
+    ret 0
+  }
+}
