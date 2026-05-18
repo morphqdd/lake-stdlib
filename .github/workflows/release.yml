@@ -1,0 +1,26 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  pack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: pack stdlib
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          tar -czf "stdlib-${VER}.tar.gz" std
+
+      - name: upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: stdlib-*.tar.gz
+          fail_on_unmatched_files: true
