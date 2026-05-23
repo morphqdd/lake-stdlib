@@ -126,3 +126,669 @@ pub slice is {
     }
   }
 }
+
+// `concat_bb(a, b)` — concatenate two runtime bufs.  Mirror of
+// `concat_buf` for the all-buf case (path joins, accumulated
+// output, lock-file builders, etc.).
+pub concat_bb is {
+  a buf b buf -> ret buf {
+    let la = size(a)
+    let lb = size(b)
+    let total = la + lb
+    let r = rt_allocate(total)
+    when r.0 {
+      :ok -> {
+        let dst = r.1
+        rt_copy_bytes(dst 0  a 0 la)
+        rt_copy_bytes(dst la b 0 lb)
+        let _t = trim(dst total)
+        ret dst
+      }
+      _ -> {
+        die()
+        ret r.1
+      }
+    }
+  }
+}
+
+// `slice_buf(b, off, n)` — buf-receiver counterpart of `slice`.
+pub slice_buf is {
+  b buf off i64 n i64 -> ret buf {
+    let r = rt_allocate(n)
+    when r.0 {
+      :ok -> {
+        let dst = r.1
+        rt_copy_bytes(dst 0 b off n)
+        ret dst
+      }
+      _ -> {
+        die()
+        ret r.1
+      }
+    }
+  }
+}
+
+// ── prefix / suffix / contains ───────────────────────────────────
+
+// Byte-walker tail used by all match helpers.  Returns 1 when
+// `b[bo..bo+n]` equals `a[ao..ao+n]`.  rt_load_u8 accepts both
+// `str` and `buf` fat-ptrs via the ABI overlap, so a single
+// implementation serves every str/buf combination.
+pub bytes_eq_at is {
+  a buf ao i64 b buf bo i64 i i64 n i64 -> ret i64 {
+    when i == n {
+      true -> { ret 1 }
+      _    -> {
+        when a[ao + i] == b[bo + i] {
+          true -> { self(a ao b bo i + 1 n) }
+          _    -> { ret 0 }
+        }
+      }
+    }
+  }
+}
+
+// `starts_with(haystack, prefix)` — 1 iff `haystack` begins with
+// `prefix`.  Works for any str/buf combination (rt_load_u8 ABI).
+pub starts_with is {
+  haystack buf prefix buf -> ret i64 {
+    let lh = size(haystack)
+    let lp = size(prefix)
+    when lp > lh {
+      true -> { ret 0 }
+      _    -> { ret bytes_eq_at(haystack 0 prefix 0 0 lp) }
+    }
+  }
+}
+
+// `ends_with(haystack, suffix)` — 1 iff `haystack` ends with
+// `suffix`.
+pub ends_with is {
+  haystack buf suffix buf -> ret i64 {
+    let lh = size(haystack)
+    let ls = size(suffix)
+    when ls > lh {
+      true -> { ret 0 }
+      _    -> { ret bytes_eq_at(haystack lh - ls suffix 0 0 ls) }
+    }
+  }
+}
+
+// `index_of_byte(b, byte)` — first offset of `byte` in `b`, or
+// -1 if absent.  Useful for splitting on `=` / `\n` / `:`.
+pub index_of_byte is {
+  b buf byte i64 -> ret i64 {
+    let n = size(b)
+    ret index_of_byte_from(b byte 0 n)
+  }
+}
+
+pub index_of_byte_from is {
+  b buf byte i64 i i64 n i64 -> ret i64 {
+    when i >= n {
+      true -> { ret 0 - 1 }
+      _    -> {
+        when b[i] == byte {
+          true -> { ret i }
+          _    -> { self(b byte i + 1 n) }
+        }
+      }
+    }
+  }
+}
+
+// `last_index_of_byte(b, byte)` — last offset of `byte` in `b`,
+// or -1 if absent.
+pub last_index_of_byte is {
+  b buf byte i64 -> ret i64 {
+    let n = size(b)
+    ret last_index_of_byte_from(b byte n - 1)
+  }
+}
+
+pub last_index_of_byte_from is {
+  b buf byte i64 i i64 -> ret i64 {
+    when i < 0 {
+      true -> { ret 0 - 1 }
+      _    -> {
+        when b[i] == byte {
+          true -> { ret i }
+          _    -> { self(b byte i - 1) }
+        }
+      }
+    }
+  }
+}
+
+// `index_of(haystack, needle)` — first offset where `needle`
+// matches as a contiguous substring, or -1.  Naive O(n*m) scan;
+// adequate for short config tokens and CLI args.
+pub index_of is {
+  haystack buf needle buf -> ret i64 {
+    let lh = size(haystack)
+    let ln = size(needle)
+    when ln == 0 {
+      true -> { ret 0 }
+      _    -> {
+        when ln > lh {
+          true -> { ret 0 - 1 }
+          _    -> { ret index_of_scan(haystack needle 0 lh ln) }
+        }
+      }
+    }
+  }
+}
+
+pub index_of_scan is {
+  h buf n buf i i64 lh i64 ln i64 -> ret i64 {
+    when i + ln > lh {
+      true -> { ret 0 - 1 }
+      _    -> {
+        let eq = bytes_eq_at(h i n 0 0 ln)
+        when eq == 1 {
+          true -> { ret i }
+          _    -> { self(h n i + 1 lh ln) }
+        }
+      }
+    }
+  }
+}
+
+// `contains(haystack, needle)` — 1 iff `needle` appears anywhere
+// in `haystack`.
+pub contains is {
+  haystack buf needle buf -> ret i64 {
+    let idx = index_of(haystack needle)
+    when idx < 0 {
+      true -> { ret 0 }
+      _    -> { ret 1 }
+    }
+  }
+}
+
+// ── ASCII case ───────────────────────────────────────────────────
+
+// Allocate a fresh buf of size `n` and run the byte-mapping
+// machine `f` over `src[0..n]`.  Used by to_lower / to_upper to
+// share the alloc + walk skeleton.
+pub map_bytes_lower is {
+  src buf -> ret buf {
+    let n = size(src)
+    let r = rt_allocate(n)
+    when r.0 {
+      :ok -> {
+        let dst = r.1
+        map_lower_loop(src dst 0 n)
+        let _t = trim(dst n)
+        ret dst
+      }
+      _ -> {
+        die()
+        ret r.1
+      }
+    }
+  }
+}
+
+pub map_lower_loop is {
+  src buf dst buf i i64 n i64 -> ret i64 {
+    when i >= n {
+      true -> { ret 0 }
+      _    -> {
+        let b = src[i]
+        when b >= 65 {
+          true -> {
+            when b <= 90 {
+              true  -> { set(dst i b + 32) }
+              false -> { set(dst i b) }
+            }
+          }
+          false -> { set(dst i b) }
+        }
+        self(src dst i + 1 n)
+      }
+    }
+  }
+}
+
+pub map_bytes_upper is {
+  src buf -> ret buf {
+    let n = size(src)
+    let r = rt_allocate(n)
+    when r.0 {
+      :ok -> {
+        let dst = r.1
+        map_upper_loop(src dst 0 n)
+        let _t = trim(dst n)
+        ret dst
+      }
+      _ -> {
+        die()
+        ret r.1
+      }
+    }
+  }
+}
+
+pub map_upper_loop is {
+  src buf dst buf i i64 n i64 -> ret i64 {
+    when i >= n {
+      true -> { ret 0 }
+      _    -> {
+        let b = src[i]
+        when b >= 97 {
+          true -> {
+            when b <= 122 {
+              true  -> { set(dst i b - 32) }
+              false -> { set(dst i b) }
+            }
+          }
+          false -> { set(dst i b) }
+        }
+        self(src dst i + 1 n)
+      }
+    }
+  }
+}
+
+// `to_lower(s)` — ASCII lowercase copy; non-ASCII bytes pass
+// through unchanged.
+pub to_lower is {
+  s buf -> ret buf { ret map_bytes_lower(s) }
+}
+
+// `to_upper(s)` — ASCII uppercase copy; non-ASCII bytes pass
+// through unchanged.
+pub to_upper is {
+  s buf -> ret buf { ret map_bytes_upper(s) }
+}
+
+// ── trim ─────────────────────────────────────────────────────────
+
+// Whitespace check — space (0x20), tab (0x09), newline (0x0A),
+// carriage return (0x0D).  Matches the conservative POSIX
+// definition used by most line readers.  Single-Ret body via
+// bitwise OR of equality comparisons keeps it inline-able under
+// the simple-pure rule.
+pub is_ws_byte is {
+  b i64 -> ret i64 {
+    ret (b == 32) | (b == 9) | (b == 10) | (b == 13)
+  }
+}
+
+pub scan_ws_left is {
+  b buf i i64 n i64 -> ret i64 {
+    when i >= n {
+      true -> { ret n }
+      _    -> {
+        let ws = is_ws_byte(b[i])
+        when ws == 1 {
+          true -> { self(b i + 1 n) }
+          _    -> { ret i }
+        }
+      }
+    }
+  }
+}
+
+pub scan_ws_right is {
+  b buf i i64 -> ret i64 {
+    when i < 0 {
+      true -> { ret 0 - 1 }
+      _    -> {
+        let ws = is_ws_byte(b[i])
+        when ws == 1 {
+          true -> { self(b i - 1) }
+          _    -> { ret i }
+        }
+      }
+    }
+  }
+}
+
+// `trim_left(b)` — fresh buf with leading ASCII whitespace
+// stripped.  Returns an empty buf if `b` was all whitespace.
+pub trim_left is {
+  b buf -> ret buf {
+    let n = size(b)
+    let start = scan_ws_left(b 0 n)
+    ret slice_buf(b start n - start)
+  }
+}
+
+// `trim_right(b)` — fresh buf with trailing ASCII whitespace
+// stripped.
+pub trim_right is {
+  b buf -> ret buf {
+    let n = size(b)
+    let end = scan_ws_right(b n - 1)
+    ret slice_buf(b 0 end + 1)
+  }
+}
+
+// `trim_space(b)` — strip both sides.
+pub trim_space is {
+  b buf -> ret buf {
+    let n = size(b)
+    let start = scan_ws_left(b 0 n)
+    let end = scan_ws_right(b n - 1)
+    ret slice_buf(b start end + 1 - start)
+  }
+}
+
+// ── repeat / int conversion ─────────────────────────────────────
+
+// `repeat(s, n)` — concatenate `n` copies of `s` into a fresh
+// buf.  `n == 0` returns an empty buf.
+pub repeat is {
+  s str n i64 -> ret buf {
+    let ls = len(s)
+    let total = ls * n
+    let r = rt_allocate(total)
+    when r.0 {
+      :ok -> {
+        let dst = r.1
+        repeat_loop(dst s 0 ls n)
+        let _t = trim(dst total)
+        ret dst
+      }
+      _ -> {
+        die()
+        ret r.1
+      }
+    }
+  }
+}
+
+pub repeat_loop is {
+  dst buf s str i i64 ls i64 n i64 -> ret i64 {
+    when i >= n {
+      true -> { ret 0 }
+      _    -> {
+        rt_copy_bytes(dst i * ls s 0 ls)
+        self(dst s i + 1 ls n)
+      }
+    }
+  }
+}
+
+// `int_to_buf(n)` — decimal ASCII representation of an i64.
+// Handles negative numbers (leading '-') and 0.  Output is
+// trimmed to its actual length.
+pub int_to_buf is {
+  n i64 -> ret buf {
+    // 20 bytes covers i64::MIN (-9223372036854775808 = 20 chars)
+    let r = rt_allocate(20)
+    when r.0 {
+      :ok -> {
+        let dst = r.1
+        let len_written = int_to_buf_write(dst n)
+        let _t = trim(dst len_written)
+        ret dst
+      }
+      _ -> {
+        die()
+        ret r.1
+      }
+    }
+  }
+}
+
+pub int_to_buf_write is {
+  dst buf n i64 -> ret i64 {
+    when n == 0 {
+      true -> {
+        set(dst 0 48)
+        ret 1
+      }
+      _ -> {
+        when n < 0 {
+          true -> {
+            set(dst 0 45)
+            let written = int_digits_fwd(dst 0 - n 1)
+            ret written
+          }
+          _ -> { ret int_digits_fwd(dst n 0) }
+        }
+      }
+    }
+  }
+}
+
+// Reverse-fill digits at the tail, then shift left to the
+// caller's offset.  Simpler approach: write digits in reverse
+// at the END of a 20-byte buffer, then memmove.  We instead use
+// a length counter + post-reverse in place.
+pub int_digits_fwd is {
+  dst buf n i64 off i64 -> ret i64 {
+    let count = int_digits_write_rev(dst n off)
+    int_reverse_range(dst off off + count - 1)
+    ret off + count
+  }
+}
+
+pub int_digits_write_rev is {
+  dst buf n i64 off i64 -> ret i64 {
+    when n == 0 {
+      true -> { ret 0 }
+      _    -> {
+        let digit = n - n / 10 * 10
+        set(dst off 48 + digit)
+        let rest = int_digits_write_rev(dst n / 10 off + 1)
+        ret rest + 1
+      }
+    }
+  }
+}
+
+pub int_reverse_range is {
+  dst buf lo i64 hi i64 -> ret i64 {
+    when lo >= hi {
+      true -> { ret 0 }
+      _    -> {
+        let a = dst[lo]
+        let b = dst[hi]
+        set(dst lo b)
+        set(dst hi a)
+        self(dst lo + 1 hi - 1)
+      }
+    }
+  }
+}
+
+// `parse_int(b)` — parse leading optional sign + decimal digits
+// from `b`.  Returns `{:ok n}` on success or `{:err 0}` if `b`
+// is empty or contains no digits at all.  Stops at the first
+// non-digit byte (no error on trailing garbage — slice first if
+// strictness is needed).
+pub parse_int is {
+  b buf -> ret {atom i64} {
+    let n = size(b)
+    when n == 0 {
+      true -> { ret { :err 0 } }
+      _ -> {
+        let first = b[0]
+        when first == 45 {
+          true -> {
+            let r = parse_digits(b 1 n 0)
+            when r.0 {
+              :ok -> { ret { :ok 0 - r.1 } }
+              _   -> { ret { :err 0 } }
+            }
+          }
+          _ -> {
+            when first == 43 {
+              true -> { ret parse_digits(b 1 n 0) }
+              _    -> { ret parse_digits(b 0 n 0) }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+pub parse_digits is {
+  b buf i i64 n i64 acc i64 -> ret {atom i64} {
+    when i >= n {
+      true -> {
+        when i == 0 {
+          true -> { ret { :err 0 } }
+          _    -> { ret { :ok acc } }
+        }
+      }
+      _ -> {
+        let c = b[i]
+        when c >= 48 {
+          true -> {
+            when c <= 57 {
+              true  -> { self(b i + 1 n acc * 10 + c - 48) }
+              false -> {
+                when i == 0 {
+                  true  -> { ret { :err 0 } }
+                  false -> { ret { :ok acc } }
+                }
+              }
+            }
+          }
+          false -> {
+            when i == 0 {
+              true  -> { ret { :err 0 } }
+              false -> { ret { :ok acc } }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// ── lines / line iteration ──────────────────────────────────────
+//
+// Lake has no first-class lists yet, so line iteration is done
+// via the (count, index) pair: `line_count(b)` returns the number
+// of LF-separated lines and `line_at(b, idx)` returns the idx-th
+// line as a fresh buf.  Callers loop via self-recursive helpers.
+//
+// A trailing newline does NOT add an empty line (POSIX-ish).
+// Empty buf → 0 lines.  Buf without any newline → 1 line.
+
+// Count LF (`\n`) occurrences in `b`.  Used by `line_count` and
+// any caller that wants a quick newline tally.
+pub count_byte is {
+  b buf byte i64 -> ret i64 {
+    let n = size(b)
+    ret count_byte_loop(b byte 0 n 0)
+  }
+}
+
+pub count_byte_loop is {
+  b buf byte i64 i i64 n i64 acc i64 -> ret i64 {
+    when i >= n {
+      true -> { ret acc }
+      _    -> {
+        when b[i] == byte {
+          true  -> { self(b byte i + 1 n acc + 1) }
+          false -> { self(b byte i + 1 n acc) }
+        }
+      }
+    }
+  }
+}
+
+// `line_count(b)` — number of LF-separated lines in `b`.  Empty
+// buf returns 0.  A trailing `\n` does NOT add an empty line.
+pub line_count is {
+  b buf -> ret i64 {
+    let n = size(b)
+    when n == 0 {
+      true -> { ret 0 }
+      _ -> {
+        let nl = count_byte(b 10)
+        let last = b[n - 1]
+        when last == 10 {
+          true  -> { ret nl }
+          false -> { ret nl + 1 }
+        }
+      }
+    }
+  }
+}
+
+// Forward-scan helper: returns the offset of the next `\n` at or
+// after `from`, or `size(b)` if none.  Useful for hand-rolled
+// streaming over lines.
+pub next_newline is {
+  b buf from i64 -> ret i64 {
+    let n = size(b)
+    ret next_newline_loop(b from n)
+  }
+}
+
+pub next_newline_loop is {
+  b buf i i64 n i64 -> ret i64 {
+    when i >= n {
+      true -> { ret n }
+      _    -> {
+        when b[i] == 10 {
+          true -> { ret i }
+          _    -> { self(b i + 1 n) }
+        }
+      }
+    }
+  }
+}
+
+// Compute the START offset of line `idx` (0-based).  Walks the
+// buf one newline at a time.  Returns `size(b)` once `idx` is out
+// of range — caller should pair with `line_count` first.
+pub line_start_offset is {
+  b buf idx i64 -> ret i64 {
+    when idx == 0 {
+      true -> { ret 0 }
+      _ -> {
+        let n = size(b)
+        ret line_start_loop(b idx 0 n)
+      }
+    }
+  }
+}
+
+pub line_start_loop is {
+  b buf remaining i64 cursor i64 n i64 -> ret i64 {
+    when remaining == 0 {
+      true -> { ret cursor }
+      _ -> {
+        when cursor >= n {
+          true -> { ret n }
+          _ -> {
+            let nl = next_newline_loop(b cursor n)
+            when nl >= n {
+              true  -> { ret n }
+              false -> { self(b remaining - 1 nl + 1 n) }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// `line_at(b, idx)` — fresh buf containing the bytes of line
+// `idx` (0-based), exclusive of the trailing `\n`.  Empty buf if
+// `idx` is out of range or points at an empty line.
+pub line_at is {
+  b buf idx i64 -> ret buf {
+    let n = size(b)
+    let start = line_start_offset(b idx)
+    when start >= n {
+      true -> { ret slice_buf(b 0 0) }
+      _ -> {
+        let endnl = next_newline_loop(b start n)
+        ret slice_buf(b start endnl - start)
+      }
+    }
+  }
+}
