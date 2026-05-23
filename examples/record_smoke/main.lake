@@ -1,0 +1,18 @@
+// Records via `is` (#058) — schema + ctor + dot-access + destructure.
+
++std.io.{ println print_buf }
+
+Greeting is {
+  who buf
+  count i64
+}
+
+main is {
+  _ -> {
+    let g = Greeting("world" 3)
+    pin println(g.who)
+    let { who count } = g
+    pin print_buf(who)
+    pin println("!")
+  }
+}
