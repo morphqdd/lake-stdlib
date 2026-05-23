@@ -792,3 +792,48 @@ pub line_at is {
     }
   }
 }
+
+// ── parser primitives ───────────────────────────────────────────
+//
+// scan_to_* helpers find the FIRST byte matching a predicate at
+// or after `from`.  Symmetric counterparts of `scan_ws_left`
+// (which skips matching bytes and stops at the first non-match).
+// Range is `[from, n)`; result is in `[from, n]` — `n` signals
+// "no match" so callers can `slice_buf(b from result - from)`
+// to get the prefix without an explicit absent-check.
+
+// `scan_to_byte(b, from, n, byte)` — first index in `[from, n)`
+// where `b[i] == byte`, or `n` if none.  Common pattern:
+// `let space = scan_to_byte(req 0 size(req) 32)`.
+pub scan_to_byte is {
+  b buf from i64 n i64 byte i64 -> ret i64 {
+    when from >= n {
+      true -> { ret n }
+      _    -> {
+        when b[from] == byte {
+          true  -> { ret from }
+          false -> { self(b from + 1 n byte) }
+        }
+      }
+    }
+  }
+}
+
+// `scan_to_ws(b, from, n)` — first whitespace byte (SP / TAB /
+// LF / CR) in `[from, n)`, or `n` if none.  Matches `is_ws_byte`
+// definition.
+pub scan_to_ws is {
+  b buf from i64 n i64 -> ret i64 {
+    when from >= n {
+      true -> { ret n }
+      _ -> {
+        let c = b[from]
+        let ws = (c == 32) | (c == 9) | (c == 10) | (c == 13)
+        when ws == 1 {
+          true -> { ret from }
+          _    -> { self(b from + 1 n) }
+        }
+      }
+    }
+  }
+}
