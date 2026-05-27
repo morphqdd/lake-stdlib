@@ -22,6 +22,7 @@
 +std.bytes.{ size trim }
 
 @rt(rt_allocate)
+@rt(rt_arena_alloc)
 @rt(rt_copy_bytes)
 @rt(len)
 @rt(cmp_str_buf)
@@ -44,20 +45,11 @@ pub concat_buf is {
     let la = size(a)
     let lb = len(b)
     let total = la + lb
-    let r = rt_allocate(total)
-    when r.0 {
-      :ok -> {
-        let dst = r.1
-        rt_copy_bytes(dst 0  a 0 la)
-        rt_copy_bytes(dst la b 0 lb)
-        let _t = trim(dst total)
-        ret dst
-      }
-      _ -> {
-        die()
-        ret r.1
-      }
-    }
+    let dst = rt_arena_alloc(total)
+    rt_copy_bytes(dst 0  a 0 la)
+    rt_copy_bytes(dst la b 0 lb)
+    let _t = trim(dst total)
+    ret dst
   }
 }
 
@@ -67,19 +59,10 @@ pub concat is {
     let la = len(a)
     let lb = len(b)
     let total = la + lb
-    let r = rt_allocate(total)
-    when r.0 {
-      :ok -> {
-        let dst = r.1
-        rt_copy_bytes(dst 0 a 0 la)
-        rt_copy_bytes(dst la b 0 lb)
-        ret dst
-      }
-      _ -> {
-        die()
-        ret r.1
-      }
-    }
+    let dst = rt_arena_alloc(total)
+    rt_copy_bytes(dst 0 a 0 la)
+    rt_copy_bytes(dst la b 0 lb)
+    ret dst
   }
 }
 
@@ -90,20 +73,11 @@ pub concat3 is {
     let lb = len(b)
     let lc = len(c)
     let total = la + lb + lc
-    let r = rt_allocate(total)
-    when r.0 {
-      :ok -> {
-        let dst = r.1
-        rt_copy_bytes(dst 0       a 0 la)
-        rt_copy_bytes(dst la      b 0 lb)
-        rt_copy_bytes(dst la + lb c 0 lc)
-        ret dst
-      }
-      _ -> {
-        die()
-        ret r.1
-      }
-    }
+    let dst = rt_arena_alloc(total)
+    rt_copy_bytes(dst 0       a 0 la)
+    rt_copy_bytes(dst la      b 0 lb)
+    rt_copy_bytes(dst la + lb c 0 lc)
+    ret dst
   }
 }
 
@@ -112,18 +86,9 @@ pub concat3 is {
 // later free of `s`.
 pub slice is {
   s str off i64 n i64 -> ret buf {
-    let r = rt_allocate(n)
-    when r.0 {
-      :ok -> {
-        let dst = r.1
-        rt_copy_bytes(dst 0 s off n)
-        ret dst
-      }
-      _ -> {
-        die()
-        ret r.1
-      }
-    }
+    let dst = rt_arena_alloc(n)
+    rt_copy_bytes(dst 0 s off n)
+    ret dst
   }
 }
 
@@ -135,38 +100,20 @@ pub concat_bb is {
     let la = size(a)
     let lb = size(b)
     let total = la + lb
-    let r = rt_allocate(total)
-    when r.0 {
-      :ok -> {
-        let dst = r.1
-        rt_copy_bytes(dst 0  a 0 la)
-        rt_copy_bytes(dst la b 0 lb)
-        let _t = trim(dst total)
-        ret dst
-      }
-      _ -> {
-        die()
-        ret r.1
-      }
-    }
+    let dst = rt_arena_alloc(total)
+    rt_copy_bytes(dst 0  a 0 la)
+    rt_copy_bytes(dst la b 0 lb)
+    let _t = trim(dst total)
+    ret dst
   }
 }
 
 // `slice_buf(b, off, n)` — buf-receiver counterpart of `slice`.
 pub slice_buf is {
   b buf off i64 n i64 -> ret buf {
-    let r = rt_allocate(n)
-    when r.0 {
-      :ok -> {
-        let dst = r.1
-        rt_copy_bytes(dst 0 b off n)
-        ret dst
-      }
-      _ -> {
-        die()
-        ret r.1
-      }
-    }
+    let dst = rt_arena_alloc(n)
+    rt_copy_bytes(dst 0 b off n)
+    ret dst
   }
 }
 
@@ -316,19 +263,10 @@ pub contains is {
 pub map_bytes_lower is {
   src buf -> ret buf {
     let n = size(src)
-    let r = rt_allocate(n)
-    when r.0 {
-      :ok -> {
-        let dst = r.1
-        map_lower_loop(src dst 0 n)
-        let _t = trim(dst n)
-        ret dst
-      }
-      _ -> {
-        die()
-        ret r.1
-      }
-    }
+    let dst = rt_arena_alloc(n)
+    map_lower_loop(src dst 0 n)
+    let _t = trim(dst n)
+    ret dst
   }
 }
 
@@ -356,19 +294,10 @@ pub map_lower_loop is {
 pub map_bytes_upper is {
   src buf -> ret buf {
     let n = size(src)
-    let r = rt_allocate(n)
-    when r.0 {
-      :ok -> {
-        let dst = r.1
-        map_upper_loop(src dst 0 n)
-        let _t = trim(dst n)
-        ret dst
-      }
-      _ -> {
-        die()
-        ret r.1
-      }
-    }
+    let dst = rt_arena_alloc(n)
+    map_upper_loop(src dst 0 n)
+    let _t = trim(dst n)
+    ret dst
   }
 }
 
@@ -486,19 +415,10 @@ pub repeat is {
   s str n i64 -> ret buf {
     let ls = len(s)
     let total = ls * n
-    let r = rt_allocate(total)
-    when r.0 {
-      :ok -> {
-        let dst = r.1
-        repeat_loop(dst s 0 ls n)
-        let _t = trim(dst total)
-        ret dst
-      }
-      _ -> {
-        die()
-        ret r.1
-      }
-    }
+    let dst = rt_arena_alloc(total)
+    repeat_loop(dst s 0 ls n)
+    let _t = trim(dst total)
+    ret dst
   }
 }
 
@@ -520,19 +440,10 @@ pub repeat_loop is {
 pub int_to_buf is {
   n i64 -> ret buf {
     // 20 bytes covers i64::MIN (-9223372036854775808 = 20 chars)
-    let r = rt_allocate(20)
-    when r.0 {
-      :ok -> {
-        let dst = r.1
-        let len_written = int_to_buf_write(dst n)
-        let _t = trim(dst len_written)
-        ret dst
-      }
-      _ -> {
-        die()
-        ret r.1
-      }
-    }
+    let dst = rt_arena_alloc(20)
+    let len_written = int_to_buf_write(dst n)
+    let _t = trim(dst len_written)
+    ret dst
   }
 }
 
