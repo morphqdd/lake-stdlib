@@ -12,6 +12,7 @@
 // instead, which is not the semantics user code wants.
 
 @rt(rt_allocate)
+@rt(rt_arena_alloc)
 @rt(rt_die_actor)
 // Global process exit lives in `std.sys.exit` — re-importing it
 // here would create a duplicate `exit` name (`std.process.exit`
@@ -83,3 +84,24 @@ pub alloc_or_die is {
     }
   }
 }
+
+// `arena_alloc(n)` — bump-allocate `n` bytes from the current actor's
+// per-actor arena (feature #138).  Every allocation made via this
+// path is automatically reclaimed when the actor dies, freeing user
+// code from manually calling `rt_free` on temporary scratch buffers
+// (string slices, intermediate concat results, record literals, …).
+//
+// Falls back to `rt_allocate_raw` when the arena is exhausted (default
+// 64 KB per actor) or absent (`init_main_process` doesn't allocate
+// an arena).  Failure in the fallback path dies the actor — same
+// semantics as `alloc_or_die`.
+//
+// Trade-off vs `alloc`: no `:err` tuple to pattern-match — failures
+// crash the actor.  Use when you want concise code AND auto-cleanup,
+// not when you need recoverable OOM handling.
+pub arena_alloc is {
+  n i64 -> ret buf {
+    ret rt_arena_alloc(n)
+  }
+}
+
