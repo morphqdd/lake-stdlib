@@ -1,0 +1,258 @@
+// Postgres v3 wire framing.  See docs/state/features/154_postgres_client.md.
+//
+// Every backend/frontend message is `[type:u8][len:u32 BE][payload]`,
+// where `len` covers the four length bytes PLUS the payload but NOT
+// the type byte.  The lone exception is StartupMessage which omits
+// the type byte: `[len:u32 BE][payload]`.
+//
+// All helpers here allocate via `arena_alloc` — the connection actor
+// owns the resulting bufs and they're reclaimed at actor death.
+
++std.bytes.{ set set_be32 be32 size addr trim }
++std.tcp.{ recv send close }
++std.process.{ arena_alloc die }
++std.io.{ eprintln }
+
+@rt(rt_copy_bytes)
+@rt(rt_send_async)
+@rt(rt_recv_async)
+@rt(len)
+
+// ── big-endian 16-bit helpers (not in std.bytes yet) ────────────
+
+pub be16 is {
+  b buf off i64 -> ret i64 {
+    let hi = b[off]
+    let lo = b[off + 1]
+    ret hi << 8 | lo
+  }
+}
+
+pub set_be16 is {
+  b buf off i64 val i64 -> ret i64 {
+    set(b off     val >> 8 & 0xff)
+    set(b off + 1 val       & 0xff)
+    ret 0
+  }
+}
+
+// ── frame builder ────────────────────────────────────────────────
+//
+// `encode_msg(type, payload, payload_len)` returns a fresh buf:
+//   [type:u8][len:u32 BE][payload...]
+// `len` is `payload_len + 4` (covers itself + payload).
+//
+// Pass `type == 0` to emit a StartupMessage-shaped frame (no type
+// byte), in which case the resulting buf is `[len:u32 BE][payload]`.
+pub encode_msg is {
+  type i64 payload buf payload_len i64 -> ret buf {
+    when type == 0 {
+      true -> {
+        let total = payload_len + 4
+        let buf = arena_alloc(total)
+        set_be32(buf 0 total)
+        rt_copy_bytes(buf 4 payload 0 payload_len)
+        ret buf
+      }
+      false -> {
+        let total = payload_len + 5
+        let buf = arena_alloc(total)
+        set(buf 0 type)
+        set_be32(buf 1 payload_len + 4)
+        rt_copy_bytes(buf 5 payload 0 payload_len)
+        ret buf
+      }
+    }
+  }
+}
+
+// ── socket send ──────────────────────────────────────────────────
+//
+// `send_msg(fd, type, payload, payload_len)` — assemble + send.
+
+pub send_msg is {
+  fd i64 type i64 payload buf payload_len i64 -> ret i64 {
+    let frame = encode_msg(type payload payload_len)
+    let n = size(frame)
+    rt_send_async(fd frame n)
+    ret 0
+  }
+}
+
+// `send_raw(fd, buf)` — for callers that pre-built a full frame
+// (StartupMessage usually does).
+pub send_raw is {
+  fd i64 b buf -> ret i64 {
+    let n = size(b)
+    rt_send_async(fd b n)
+    ret 0
+  }
+}
+
+// ── read_msg ─────────────────────────────────────────────────────
+//
+// Read one backend frame from `fd` and return `{type payload}` where
+// `type` is the 1-byte tag (e.g. 'R' = 82 = Authentication, 'Z' = 90
+// = ReadyForQuery, …) and `payload` is the post-length bytes.
+//
+// On EOF / partial frame we return `{0 zero_buf}` and the caller
+// should treat the connection as dead.  No exception machinery yet
+// in Lake — atom returns are the convention.
+//
+// Wire layout:    [type:u8][len:u32 BE][payload]
+// len includes the 4 length bytes; payload size = len - 4.
+pub read_msg is {
+  fd i64 -> ret {i64 buf} {
+    let hdr = arena_alloc(5)
+    let got = rt_recv_async(fd hdr 5)
+    when got <= 0 {
+      true -> { ret { 0 hdr } }
+      _ -> {
+        // got may be < 5 — drain the rest.
+        drain_into(fd hdr got 5)
+        let type = hdr[0]
+        let plen = be32(hdr 1) - 4
+        when plen <= 0 {
+          true -> { ret { type arena_alloc(0) } }
+          _ -> {
+            let payload = arena_alloc(plen)
+            let drained = drain_into(fd payload 0 plen)
+            when drained < 0 {
+              true -> { ret { 0 payload } }
+              _ -> { ret { type payload } }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// drain_into(fd, buf, already, want) — fill buf[already..want] from
+// fd via repeated rt_recv_async into a temp slot then memcpy.  Lake's
+// rt_recv_async always writes at offset 0 of the supplied buf, so we
+// use a 1-byte scratch and walk one syscall per chunk.  For MVP this
+// is fine — Postgres frames are small (< 64 KB typical) and the
+// pipeline is correctness-first.
+//
+// TODO(perf): once rt_recv_async supports an offset arg, swap this
+// for an in-place read.  Tracked in feature 154 known-gaps.
+pub drain_into is {
+  fd i64 buf buf off i64 want i64 -> ret i64 {
+    when off >= want {
+      true -> { ret 0 }
+      _ -> {
+        let need = want - off
+        let scratch = arena_alloc(need)
+        let got = rt_recv_async(fd scratch need)
+        when got <= 0 {
+          true -> { ret 0 - 1 }
+          _ -> {
+            rt_copy_bytes(buf off scratch 0 got)
+            self(fd buf off + got want)
+          }
+        }
+      }
+    }
+  }
+}
+
+// ── payload writers ─────────────────────────────────────────────
+//
+// Frame payloads are built up via a tiny in-place writer.  Caller
+// pre-allocates a buf big enough for the worst case, walks `pwrite_*`
+// helpers, then passes the final length to `encode_msg`.
+
+// Write a NUL-terminated string into `buf` at `off`; return new off.
+pub pwrite_cstr is {
+  buf buf off i64 s str -> ret i64 {
+    let n = len(s)
+    rt_copy_bytes(buf off s 0 n)
+    set(buf off + n 0)
+    ret off + n + 1
+  }
+}
+
+// Write a NUL-terminated buf payload into `buf` at `off`.
+pub pwrite_cbuf is {
+  buf buf off i64 src buf -> ret i64 {
+    let n = size(src)
+    rt_copy_bytes(buf off src 0 n)
+    set(buf off + n 0)
+    ret off + n + 1
+  }
+}
+
+// Write a single byte; return new off.
+pub pwrite_u8 is {
+  buf buf off i64 val i64 -> ret i64 {
+    set(buf off val)
+    ret off + 1
+  }
+}
+
+// Write a big-endian 16-bit value; return new off.
+pub pwrite_u16 is {
+  buf buf off i64 val i64 -> ret i64 {
+    set_be16(buf off val)
+    ret off + 2
+  }
+}
+
+// Write a big-endian 32-bit value; return new off.
+pub pwrite_u32 is {
+  buf buf off i64 val i64 -> ret i64 {
+    set_be32(buf off val)
+    ret off + 4
+  }
+}
+
+// Write raw bytes from `src` (no NUL); return new off.
+pub pwrite_bytes is {
+  buf buf off i64 src buf src_len i64 -> ret i64 {
+    rt_copy_bytes(buf off src 0 src_len)
+    ret off + src_len
+  }
+}
+
+// ── payload readers ─────────────────────────────────────────────
+
+// Read a NUL-terminated string starting at `off` in `payload`.
+// Returns `{end_off, str_buf}` where end_off is the offset AFTER the
+// NUL terminator (suitable to feed back as the next read's off).
+pub pread_cstr is {
+  payload buf off i64 -> ret {i64 buf} {
+    let plen = size(payload)
+    let end = scan_nul(payload off plen)
+    let n = end - off
+    let out = arena_alloc(n)
+    rt_copy_bytes(out 0 payload off n)
+    ret { end + 1 out }
+  }
+}
+
+pub scan_nul is {
+  b buf i i64 n i64 -> ret i64 {
+    when i >= n {
+      true -> { ret n }
+      _ -> {
+        when b[i] == 0 {
+          true -> { ret i }
+          _    -> { self(b i + 1 n) }
+        }
+      }
+    }
+  }
+}
+
+pub pread_u8 is {
+  b buf off i64 -> ret i64 { ret b[off] }
+}
+
+pub pread_u16 is {
+  b buf off i64 -> ret i64 { ret be16(b off) }
+}
+
+pub pread_u32 is {
+  b buf off i64 -> ret i64 { ret be32(b off) }
+}
