@@ -72,16 +72,16 @@ pub alloc is {
 // Suitable for stdlib helpers and application code where OOM
 // recovery is out of scope — the alternative is the explicit
 // `when r.0 { :ok -> ... :err -> ... }` ladder that `alloc` gives.
+// Fix bug #76: `rt_allocate(n)` returns a raw slab chunk that the
+// caller must explicitly `rt_free`.  Stdlib helpers like `cstr_of`
+// (`std/experimental/fs.lake:62`) discard the returned buf, leaking
+// one class-(ceil_log2(n+16)-4) chunk per call.  Route through the
+// arena instead — caller's arena reclaims the buf at actor death.
+// OOM-die semantics preserved: rt_arena_alloc's fallback path
+// invokes rt_die_actor on OOM, same as the original wrapper.
 pub alloc_or_die is {
   n i64 -> ret buf {
-    let r = rt_allocate(n)
-    when r.0 {
-      :ok -> { ret r.1 }
-      _   -> {
-        die()
-        ret r.1
-      }
-    }
+    ret rt_arena_alloc(n)
   }
 }
 
