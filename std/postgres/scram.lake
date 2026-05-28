@@ -109,7 +109,7 @@ pub unwrap_or_die is {
   r {atom i64} -> ret i64 {
     when r.0 {
       :ok -> { ret r.1 }
-      _   -> { die() ret 0 }
+      _   -> { die() }
     }
   }
 }
@@ -175,9 +175,9 @@ pub verify_server_final is {
     let expected_b64 = encode(server_sig 32)
     let exp_len = size(expected_b64)
     let got_len = size(sig_b64)
-    when exp_len != got_len {
-      true -> { ret 0 }
-      _ -> { ret bytes_eq(expected_b64 sig_b64 0 exp_len) }
+    when exp_len == got_len {
+      true -> { ret bytes_eq(expected_b64 sig_b64 0 exp_len) }
+      _ -> { ret 0 }
     }
   }
 }

@@ -34,9 +34,9 @@ sbuf is {
 main is {
   _ -> {
     let host = ip_v4(127 0 0 1)
-    let user = sbuf("postgres" 8)
-    let db = sbuf("postgres" 8)
-    let password = sbuf("test" 4)
+    let user = sbuf("forkast" 7)
+    let db = sbuf("forkast" 7)
+    let password = sbuf("forkast" 7)
     pin println("pg smoke: connecting…")
     let c = connect(host 5432 user db password)
     when c.ok {
