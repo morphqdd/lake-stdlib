@@ -1,0 +1,340 @@
+// Postgres connection — startup + auth state machine.
+//
+// `connect(host_port, db, user, password)` is a high-level wrapper
+// that:
+//   1. opens a TCP socket to the server
+//   2. sends StartupMessage
+//   3. drives auth (AuthOk / cleartext / SCRAM-SHA-256)
+//   4. consumes ParameterStatus / BackendKeyData / ReadyForQuery
+//   5. returns the live fd + parameter map for use by `query` /
+//      `prepare` / `execute`.
+//
+// Errors at any step → ErrorResponse is parsed and returned via
+// `{:err Conn_err}` tuple; caller can decide whether to die or
+// retry.  We never crash the actor in this module — let user code
+// handle.
+
++std.bytes.{ set set_be32 be32 size addr trim at }
++std.tcp.{ recv send close }
++std.process.{ arena_alloc die }
++std.io.{ println eprintln println_buf }
++std.strings.{ concat_buf concat_bb int_to_buf slice_buf }
++std.postgres.frame.{
+  encode_msg send_msg send_raw read_msg
+  pwrite_cstr pwrite_u8 pwrite_u16 pwrite_u32 pwrite_bytes pwrite_cbuf
+  pread_cstr pread_u8 pread_u16 pread_u32
+  set_be16 be16
+}
++std.postgres.scram.{
+  client_first strip_gs2
+  parse_server_first
+  build_auth_msg
+  client_final_without_proof
+  client_final
+  compute_proof
+  verify_server_final
+  static_buf
+}
+
+@rt(rt_connect_tcp)
+@rt(rt_copy_bytes)
+@rt(rt_send_async)
+@rt(rt_recv_async)
+@rt(len)
+
+// ── connection record ────────────────────────────────────────────
+
+pub Conn is {
+  fd i64
+  process_id i64
+  secret_key i64
+  ok i64        // 1 on success, 0 on error
+}
+
+// ── startup message ──────────────────────────────────────────────
+//
+// Layout (no type byte):
+//   length:u32 BE
+//   protocol_version:u32 BE = 196608 (3.0)
+//   "user\0" + user + "\0"
+//   "database\0" + db + "\0"
+//   "application_name\0lake\0"
+//   "\0"                              ← terminator
+pub build_startup is {
+  user buf db buf -> ret buf {
+    // Pre-size payload generously (max ~512 bytes for typical args).
+    // We'll trim before send.
+    let max = size(user) + size(db) + 128
+    let payload = arena_alloc(max)
+    let off0 = 0
+    let off1 = pwrite_u32(payload off0 196608)
+    let off2 = pwrite_cstr(payload off1 "user")
+    let off3 = pwrite_cbuf(payload off2 user)
+    let off4 = pwrite_cstr(payload off3 "database")
+    let off5 = pwrite_cbuf(payload off4 db)
+    let off6 = pwrite_cstr(payload off5 "application_name")
+    let off7 = pwrite_cstr(payload off6 "lake")
+    let off8 = pwrite_u8(payload off7 0)
+    // Final frame = [len:u32 BE][payload]
+    let total = off8 + 4
+    let frame = arena_alloc(total)
+    set_be32(frame 0 total)
+    rt_copy_bytes(frame 4 payload 0 off8)
+    ret frame
+  }
+}
+
+// ── auth message tags ────────────────────────────────────────────
+//
+// Authentication payload starts with a u32 BE selector:
+//   0  = OK            → no further bytes
+//   3  = Cleartext     → no further bytes (server expects PasswordMessage)
+//   5  = MD5           → 4-byte salt (NOT supported in MVP)
+//   10 = SASL          → list of NUL-terminated SASL mechanisms, ending in \0
+//   11 = SASL Continue → server-first message bytes
+//   12 = SASL Final    → server-final message bytes
+
+pub const AUTH_OK       = 0
+pub const AUTH_CLEAR    = 3
+pub const AUTH_MD5      = 5
+pub const AUTH_SASL     = 10
+pub const AUTH_SASL_CONT = 11
+pub const AUTH_SASL_FIN  = 12
+
+// ── drive auth handshake ────────────────────────────────────────
+//
+// `drive_auth` reads the FIRST auth message, dispatches per selector.
+// Returns 1 on success (saw AuthenticationOk eventually), 0 on
+// failure.  Side effect: emits PasswordMessage / SASLInitialResponse
+// / SASLResponse as required.
+pub drive_auth is {
+  fd i64 user buf password buf -> ret i64 {
+    let r = read_msg(fd)
+    let type = r.0
+    let payload = r.1
+    when type {
+      // 'R' = 82
+      82 -> {
+        let sel = be32(payload 0)
+        when sel {
+          0 -> { ret 1 }
+          3 -> {
+            // Cleartext: send "p" PasswordMessage with NUL-term pwd.
+            let pwd_len = size(password)
+            let pl = arena_alloc(pwd_len + 1)
+            rt_copy_bytes(pl 0 password 0 pwd_len)
+            set(pl pwd_len 0)
+            send_msg(fd 112 pl pwd_len + 1)
+            ret drive_auth_followup(fd)
+          }
+          10 -> {
+            ret drive_scram(fd user password payload)
+          }
+          _ -> {
+            eprintln("pg: unsupported auth selector")
+            ret 0
+          }
+        }
+      }
+      // 'E' = 69 → ErrorResponse
+      69 -> {
+        eprintln("pg: server returned error during auth")
+        ret 0
+      }
+      _ -> {
+        eprintln("pg: unexpected message during auth")
+        ret 0
+      }
+    }
+  }
+}
+
+// After PasswordMessage we expect Authentication OK + the param/keydata flurry.
+pub drive_auth_followup is {
+  fd i64 -> ret i64 {
+    let r = read_msg(fd)
+    let type = r.0
+    let payload = r.1
+    when type {
+      82 -> {
+        let sel = be32(payload 0)
+        when sel {
+          0 -> { ret 1 }
+          _ -> { ret 0 }
+        }
+      }
+      69 -> { ret 0 }
+      _ -> { ret 0 }
+    }
+  }
+}
+
+// ── SCRAM-SHA-256 driver ────────────────────────────────────────
+//
+// Initial auth payload is "SCRAM-SHA-256\0SCRAM-SHA-256-PLUS\0\0" or
+// similar — we just pick "SCRAM-SHA-256" (no channel binding for MVP).
+//
+// 1. Send SASLInitialResponse:
+//    "p" payload = mechanism_name + "\0" + len:u32 BE + client_first
+// 2. Read AuthenticationSASLContinue → server-first message bytes
+// 3. Send SASLResponse:
+//    "p" payload = client_final (no inner length prefix)
+// 4. Read AuthenticationSASLFinal → server-final message bytes
+// 5. Verify server_signature
+// 6. Read AuthenticationOk
+pub drive_scram is {
+  fd i64 user buf password buf init_payload buf -> ret i64 {
+    // Hardcoded client nonce — see scram.lake known-gaps.
+    let nonce = static_buf("lakeclientnonce0123456789abcdef" 31)
+    let cf_full = client_first(user nonce)
+    let cf_bare = strip_gs2(cf_full)
+    let cf_bare_len = size(cf_bare)
+    let mech = static_buf("SCRAM-SHA-256" 13)
+    // Build SASLInitialResponse payload:
+    //   mech "\0" len:u32 cf_full
+    let cf_full_len = size(cf_full)
+    let pl_size = 14 + 4 + cf_full_len
+    let pl = arena_alloc(pl_size)
+    let o1 = pwrite_cbuf(pl 0 mech)
+    let o2 = pwrite_u32(pl o1 cf_full_len)
+    let o3 = pwrite_bytes(pl o2 cf_full cf_full_len)
+    send_msg(fd 112 pl o3)
+    // Read AuthenticationSASLContinue (selector 11)
+    let r2 = read_msg(fd)
+    let type2 = r2.0
+    let pl2 = r2.1
+    when type2 {
+      82 -> {
+        let sel2 = be32(pl2 0)
+        when sel2 {
+          11 -> {
+            let pl2_len = size(pl2)
+            let sf = slice_buf(pl2 4 pl2_len - 4)
+            let sf_parsed = parse_server_first(sf)
+            let server_nonce = sf_parsed.r
+            let salt = sf_parsed.salt
+            let salt_len = sf_parsed.salt_len
+            let iters = sf_parsed.iters
+            let cfwp = client_final_without_proof(server_nonce)
+            let auth_msg = build_auth_msg(cf_bare sf cfwp)
+            let bundle = compute_proof(password salt salt_len iters auth_msg)
+            let proof_b64 = bundle.proof_b64
+            let salted = bundle.salted
+            let final = client_final(cfwp proof_b64)
+            let final_len = size(final)
+            let pl3 = arena_alloc(final_len)
+            rt_copy_bytes(pl3 0 final 0 final_len)
+            send_msg(fd 112 pl3 final_len)
+            // Read AuthenticationSASLFinal (selector 12)
+            let r3 = read_msg(fd)
+            let type3 = r3.0
+            let pl3r = r3.1
+            when type3 {
+              82 -> {
+                let sel3 = be32(pl3r 0)
+                when sel3 {
+                  12 -> {
+                    let pl3_len = size(pl3r)
+                    let sfin = slice_buf(pl3r 4 pl3_len - 4)
+                    let vok = verify_server_final(salted auth_msg sfin)
+                    when vok {
+                      1 -> { ret drive_auth_followup(fd) }
+                      _ -> {
+                        eprintln("pg: SCRAM server signature mismatch")
+                        ret 0
+                      }
+                    }
+                  }
+                  _ -> { ret 0 }
+                }
+              }
+              69 -> { ret 0 }
+              _   -> { ret 0 }
+            }
+          }
+          _ -> { ret 0 }
+        }
+      }
+      69 -> { ret 0 }
+      _   -> { ret 0 }
+    }
+  }
+}
+
+// ── post-auth message pump ──────────────────────────────────────
+//
+// After authentication OK the server sends a flurry of:
+//   'S' ParameterStatus    — k/v server params (ignore for MVP)
+//   'K' BackendKeyData     — process_id + secret_key for cancellation
+//   'Z' ReadyForQuery      — server idle, ready for first query
+//
+// We pump until ReadyForQuery, capturing process_id / secret_key
+// along the way.
+pub PostAuth is {
+  process_id i64
+  secret_key i64
+}
+
+pub pump_until_ready is {
+  fd i64 process_id i64 secret_key i64 -> ret PostAuth {
+    let r = read_msg(fd)
+    let type = r.0
+    let payload = r.1
+    when type {
+      // 'Z' = 90  ReadyForQuery
+      90 -> { ret PostAuth(process_id secret_key) }
+      // 'K' = 75  BackendKeyData
+      75 -> {
+        let pid = be32(payload 0)
+        let secret = be32(payload 4)
+        self(fd pid secret)
+      }
+      // 'S' = 83  ParameterStatus — ignore
+      83 -> { self(fd process_id secret_key) }
+      // 'N' = 78  NoticeResponse — ignore
+      78 -> { self(fd process_id secret_key) }
+      // 'E' = 69  ErrorResponse — bail out
+      69 -> {
+        eprintln("pg: ErrorResponse during startup")
+        ret PostAuth(0 - 1 0)
+      }
+      _ -> { self(fd process_id secret_key) }
+    }
+  }
+}
+
+// ── top-level connect ───────────────────────────────────────────
+//
+// `connect(fd, user, db, password)` — given an already-opened socket
+// `fd`, drive the startup handshake and return a Conn.  The TCP
+// connect is the caller's job since dial uses rt_connect_tcp which
+// is per-actor.
+pub connect_on_fd is {
+  fd i64 user buf db buf password buf -> ret Conn {
+    let startup = build_startup(user db)
+    send_raw(fd startup)
+    let auth_ok = drive_auth(fd user password)
+    when auth_ok {
+      1 -> {
+        let pa = pump_until_ready(fd 0 0)
+        when pa.process_id < 0 {
+          true -> { ret Conn(fd 0 0 0) }
+          _ -> { ret Conn(fd pa.process_id pa.secret_key 1) }
+        }
+      }
+      _ -> { ret Conn(fd 0 0 0) }
+    }
+  }
+}
+
+// ── shutdown ─────────────────────────────────────────────────────
+//
+// `close_conn(conn)` — send Terminate ('X'), close fd.
+pub close_conn is {
+  c Conn -> ret i64 {
+    let empty = arena_alloc(0)
+    send_msg(c.fd 88 empty 0)
+    close(c.fd)
+    ret 0
+  }
+}
