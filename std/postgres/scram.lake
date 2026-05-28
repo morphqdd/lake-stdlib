@@ -1,0 +1,245 @@
+// SCRAM-SHA-256 client (RFC 5802 + PG-specific tweaks).
+//
+// Flow:
+//   1. client_first      → "n,,n=USER,r=NONCE"
+//   2. server_first      ← "r=NONCE+SERVER,s=SALT_B64,i=ITERS"
+//   3. client_final      → "c=biws,r=NONCE+SERVER,p=PROOF_B64"
+//   4. server_final      ← "v=SIGNATURE_B64"
+//
+// Proof construction (§3, §5):
+//   SaltedPassword  = PBKDF2-HMAC-SHA256(pwd, salt, iters, 32)
+//   ClientKey       = HMAC-SHA256(SaltedPassword, "Client Key")
+//   StoredKey       = SHA-256(ClientKey)
+//   AuthMessage     = client_first_bare + "," + server_first + "," +
+//                     client_final_without_proof
+//   ClientSignature = HMAC-SHA256(StoredKey, AuthMessage)
+//   ClientProof     = ClientKey XOR ClientSignature
+//
+// ServerKey       = HMAC-SHA256(SaltedPassword, "Server Key")
+// ServerSignature = HMAC-SHA256(ServerKey, AuthMessage)
+//
+// Verify by re-computing server signature and base64-comparing.
+//
+// We use a hardcoded client nonce for MVP — the Postgres server
+// mixes it with its own and the salt, so deterministic client nonce
+// is fine for correctness (NOT for security against replay; see
+// known-gaps in docs/state/features/154_postgres_client.md).
+
++std.bytes.{ set size addr trim at }
++std.process.{ arena_alloc die }
++std.strings.{ concat concat_buf concat_bb int_to_buf parse_int slice_buf index_of_byte_from index_of_byte }
++std.crypto.sha256.{ sha256 }
++std.crypto.hmac.{ hmac_sha256 }
++std.crypto.pbkdf2.{ pbkdf2_sha256 }
++std.encoding.base64.{ encode decode decoded_len }
+
+@rt(rt_copy_bytes)
+@rt(len)
+
+// ── client first message ─────────────────────────────────────────
+//
+// client_first_bare = "n=" + user + ",r=" + nonce
+// client_first      = "n,," + client_first_bare      (gs2 header)
+// Postgres ignores `user` after the gs2 header — it uses the
+// already-authenticated user from StartupMessage — but RFC requires
+// the field present.
+pub client_first is {
+  user buf nonce buf -> ret buf {
+    // "n,,n=" prefix
+    let prefix = arena_alloc(5)
+    set(prefix 0 110) // 'n'
+    set(prefix 1 44)  // ','
+    set(prefix 2 44)  // ','
+    set(prefix 3 110) // 'n'
+    set(prefix 4 61)  // '='
+    let p1 = concat_bb(prefix user)
+    // ",r="
+    let sep = arena_alloc(3)
+    set(sep 0 44)  // ','
+    set(sep 1 114) // 'r'
+    set(sep 2 61)  // '='
+    let p2 = concat_bb(p1 sep)
+    ret concat_bb(p2 nonce)
+  }
+}
+
+// Strip the gs2 header from client_first → client_first_bare.
+// gs2 header for PG is fixed-length "n,," = 3 bytes.
+pub strip_gs2 is {
+  client_first buf -> ret buf {
+    let n = size(client_first)
+    ret slice_buf(client_first 3 n - 3)
+  }
+}
+
+// ── server first parsing ─────────────────────────────────────────
+//
+// Format: r=NONCE,s=SALT_B64,i=ITERS
+// Returns { server_nonce, salt_bytes, salt_len, iters }.
+
+pub ServerFirst is {
+  r buf
+  salt buf
+  salt_len i64
+  iters i64
+}
+
+pub parse_server_first is {
+  payload buf -> ret ServerFirst {
+    // Split on commas — only 3 fields expected for SCRAM-SHA-256.
+    let n = size(payload)
+    let c1 = index_of_byte_from(payload 44 0 n)
+    let c2 = index_of_byte_from(payload 44 c1 + 1 n)
+    // r= starts at offset 2 (skip "r=")
+    let r_val = slice_buf(payload 2 c1 - 2)
+    // s= starts at c1+3 (skip ",s=")
+    let s_val_b64 = slice_buf(payload c1 + 3 c2 - c1 - 3)
+    // i= starts at c2+3 (skip ",i=")
+    let i_val = slice_buf(payload c2 + 3 n - c2 - 3)
+    let salt_len_full = size(s_val_b64)
+    let salt_bytes_len = decoded_len(s_val_b64 salt_len_full)
+    let salt = decode(s_val_b64 salt_len_full)
+    let r = parse_int(i_val)
+    let iters = unwrap_or_die(r)
+    ret ServerFirst(r_val salt salt_bytes_len iters)
+  }
+}
+
+pub unwrap_or_die is {
+  r {atom i64} -> ret i64 {
+    when r.0 {
+      :ok -> { ret r.1 }
+      _   -> { die() ret 0 }
+    }
+  }
+}
+
+// ── proof computation ────────────────────────────────────────────
+//
+// xor_buf(a, b, len) — fresh `len`-byte buf with a[i] XOR b[i].
+pub xor_buf is {
+  a buf b buf n i64 -> ret buf {
+    let out = arena_alloc(n)
+    xor_loop(a b out 0 n)
+    ret out
+  }
+}
+
+pub xor_loop is {
+  a buf b buf out buf i i64 n i64 -> ret i64 {
+    when i >= n {
+      true -> { ret 0 }
+      _ -> {
+        let av = a[i]
+        let bv = b[i]
+        set(out i av ^ bv)
+        self(a b out i + 1 n)
+      }
+    }
+  }
+}
+
+// `compute_proof(password, salt, salt_len, iters, auth_msg)` returns
+// the base64-encoded ClientProof + the raw SaltedPassword (the
+// SaltedPassword is reused for ServerSignature verification).
+pub ProofBundle is {
+  proof_b64 buf
+  salted buf
+}
+
+pub compute_proof is {
+  password buf salt buf salt_len i64 iters i64 auth_msg buf -> ret ProofBundle {
+    let pwd_len = size(password)
+    let salted = pbkdf2_sha256(password pwd_len salt salt_len iters 32)
+    let ck_label = static_buf("Client Key" 10)
+    let client_key = hmac_sha256(salted 32 ck_label 10)
+    let stored_key = sha256(client_key 32)
+    let auth_len = size(auth_msg)
+    let client_sig = hmac_sha256(stored_key 32 auth_msg auth_len)
+    let proof_raw = xor_buf(client_key client_sig 32)
+    let proof_b64 = encode(proof_raw 32)
+    ret ProofBundle(proof_b64 salted)
+  }
+}
+
+// Verify server final message.  Returns 1 on match, 0 on mismatch.
+pub verify_server_final is {
+  salted buf auth_msg buf server_final buf -> ret i64 {
+    // server_final = "v=SIG_B64"
+    let n = size(server_final)
+    let sig_b64 = slice_buf(server_final 2 n - 2)
+    let sk_label = static_buf("Server Key" 10)
+    let server_key = hmac_sha256(salted 32 sk_label 10)
+    let auth_len = size(auth_msg)
+    let server_sig = hmac_sha256(server_key 32 auth_msg auth_len)
+    let expected_b64 = encode(server_sig 32)
+    let exp_len = size(expected_b64)
+    let got_len = size(sig_b64)
+    when exp_len != got_len {
+      true -> { ret 0 }
+      _ -> { ret bytes_eq(expected_b64 sig_b64 0 exp_len) }
+    }
+  }
+}
+
+pub bytes_eq is {
+  a buf b buf i i64 n i64 -> ret i64 {
+    when i >= n {
+      true -> { ret 1 }
+      _ -> {
+        when a[i] == b[i] {
+          true -> { self(a b i + 1 n) }
+          _    -> { ret 0 }
+        }
+      }
+    }
+  }
+}
+
+// ── client final ─────────────────────────────────────────────────
+//
+// client_final_without_proof = "c=biws,r=" + server_nonce
+//   ("biws" is the base64 of "n,," — the channel binding flag we
+//    declared in client_first.)
+// client_final = client_final_without_proof + ",p=" + proof_b64
+pub client_final_without_proof is {
+  server_nonce buf -> ret buf {
+    let prefix = static_buf("c=biws,r=" 9)
+    ret concat_bb(prefix server_nonce)
+  }
+}
+
+pub client_final is {
+  cfwp buf proof_b64 buf -> ret buf {
+    let sep = static_buf(",p=" 3)
+    let p1 = concat_bb(cfwp sep)
+    ret concat_bb(p1 proof_b64)
+  }
+}
+
+// ── helper: stash a literal string into a heap buf ───────────────
+//
+// Several primitives (hmac, base64) want a `buf`, not a `str`.
+// `static_buf("…")` copies a compile-time literal into a fresh
+// arena buf so it crosses the type boundary.
+pub static_buf is {
+  s str n i64 -> ret buf {
+    let b = arena_alloc(n)
+    rt_copy_bytes(b 0 s 0 n)
+    ret b
+  }
+}
+
+// ── auth_msg assembly ────────────────────────────────────────────
+//
+// AuthMessage = client_first_bare + "," + server_first + "," +
+//               client_final_without_proof
+pub build_auth_msg is {
+  cfb buf sf buf cfwp buf -> ret buf {
+    let comma = static_buf("," 1)
+    let p1 = concat_bb(cfb comma)
+    let p2 = concat_bb(p1 sf)
+    let p3 = concat_bb(p2 comma)
+    ret concat_bb(p3 cfwp)
+  }
+}
