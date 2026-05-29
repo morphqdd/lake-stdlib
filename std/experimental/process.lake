@@ -139,3 +139,30 @@ pub run_envp is {
     }
   }
 }
+
+// `run` with both a caller-supplied argv AND envp — each a raw
+// NULL-terminated `char**` (a buf filled via `rt_store`).  `argv_ptr`
+// must already include argv[0] (the program path).  Lets callers pass
+// an arbitrary number of CLI args (e.g. house manifest `flag` lines).
+pub run_envp_argv is {
+  prog buf argv_ptr i64 envp_ptr i64 -> ret {atom i64} {
+    let pc = cstr_of(prog)
+    let pidfd = rt_clone3_pidfd(0)
+    when pidfd < 0 {
+      true  -> { ret { :err 0 - pidfd } }
+      false -> {
+        when pidfd == 0 {
+          true  -> {
+            rt_syscall(SYS_EXECVE addr(pc) argv_ptr envp_ptr 0 0 0)
+            rt_syscall(SYS_EXIT 127 0 0 0 0 0)
+            ret { :err 127 }
+          }
+          false -> {
+            let result = wait_pidfd(pidfd)
+            ret result
+          }
+        }
+      }
+    }
+  }
+}
