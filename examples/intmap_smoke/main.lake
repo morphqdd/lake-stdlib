@@ -1,0 +1,17 @@
++std.io.{ println println_buf }
++std.hashmap.{ IntMap intmap_new intmap_put intmap_get intmap_has intmap_len }
++std.strings.{ int_to_buf }
+fill is { m IntMap[i64] i i64 -> ret IntMap[i64] {
+  when i >= 50 { true -> { ret m } _ -> { self(intmap_put(m i i * 100) i + 1) } } }}
+main is { _ -> {
+  let m0 IntMap[i64] = intmap_new()
+  let m IntMap[i64] = fill(m0 0)
+  pin println("len (want 50):")
+  pin println_buf(int_to_buf(intmap_len(m)))
+  pin println("get(7) (want 700):")
+  pin println_buf(int_to_buf(intmap_get(m 7)))
+  pin println("get(49) (want 4900):")
+  pin println_buf(int_to_buf(intmap_get(m 49)))
+  pin println("has(123) (want 0):")
+  pin println_buf(int_to_buf(intmap_has(m 123)))
+}}
