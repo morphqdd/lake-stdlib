@@ -5,14 +5,20 @@
 //         U_1 = HMAC(password, salt || INT_BE32(i))
 //         U_j = HMAC(password, U_{j-1})   for j > 1
 //
-// hash-len = 32 (SHA-256 output size).
-// Each `T_i` block is 32 bytes; the total `l` = ceil(dk_len / 32).
+// #156 followup — ZERO-ALLOC HOT LOOP.  A sync ret-machine inherits
+// the caller's arena with no per-iteration reclaim, so the original
+// version (one HMAC = ~6 buffer allocs, ×4096 iters) exhausted the
+// 64 KB arena after ~100 iterations and corrupted its accumulator.
+// We now pre-allocate every scratch buffer ONCE up front and reuse
+// it across all iterations via `hmac_sha256_into` (allocates nothing).
+// The fixed key's two padded blocks (k⊕ipad, k⊕opad) are also built
+// once — they're constant across the whole derivation.
 //
-// Verified against `hashlib.pbkdf2_hmac("sha256", …)` —
-// see `benchmark/test/pbkdf2_kat.lake` (TODO).
+// Verified against `hashlib.pbkdf2_hmac("sha256", …)`.
 
 +std.bytes.{ at set set_be32 }
-+std.crypto.hmac.{ hmac_sha256 }
++std.crypto.hmac.{ build_padded_block hmac_sha256_into }
++std.crypto.sha256.{ sha256 padded_cap fill_k_table }
 +std.process.{ alloc_or_die }
 @rt(rt_copy_bytes)
 
@@ -20,39 +26,90 @@
 // → buffer of `dk_len` bytes.
 pub pbkdf2_sha256 is {
   password buf pwd_len i64 salt buf salt_len i64 iters i64 dk_len i64 -> ret buf {
+    // Normalise key to <= 64 bytes (HMAC block size).  One-time hash
+    // for long keys; SCRAM/login passwords are short so this is the
+    // identity branch in practice.
+    let nk = norm_key(password pwd_len)
+    let key = nk.1
+    let key_len = nk.0
+
+    // Constant padded key blocks — built once, reused every HMAC.
+    let ipad_block = build_padded_block(key key_len 54)  // 0x36
+    let opad_block = build_padded_block(key key_len 92)  // 0x5C
+
+    // Largest HMAC message: U_1's input is salt||int32 (salt_len+4);
+    // later U_j inputs are 32 bytes.  Size scratch to the max.
+    let max_msg = max_i(salt_len + 4 32)
+    let k_tbl = alloc_or_die(256)
+    let _kf = fill_k_table(k_tbl)
+    let w = alloc_or_die(256)
+    let st = alloc_or_die(32)
+    let inner_in = alloc_or_die(64 + max_msg)
+    let inner_h = alloc_or_die(32)
+    let outer_in = alloc_or_die(96)
+    let pad = alloc_or_die(padded_cap(64 + max_msg))
+    // Per-block scratch.
+    let salt_int = alloc_or_die(salt_len + 4)
+    let u_a = alloc_or_die(32)
+    let u_b = alloc_or_die(32)
+    let t = alloc_or_die(32)
+
     let dk = alloc_or_die(dk_len)
     let blocks = (dk_len + 31) / 32
-    derive_blocks(password pwd_len salt salt_len iters dk 0 blocks dk_len)
+    derive_blocks(salt salt_len iters dk 0 blocks dk_len
+                  ipad_block opad_block salt_int u_a u_b t
+                  inner_in inner_h outer_in k_tbl w st pad)
     ret dk
   }
 }
 
-// Outer loop: produce `blocks` 32-byte T_i values, write each to
-// `dk[(i-1)*32..]`, then truncate the final block to fit `dk_len`.
+// Key normalisation: keys longer than the 64-byte block size are
+// replaced by their SHA-256 hash (one alloc, outside the loop).
+norm_key is {
+  password buf pwd_len i64 -> ret {i64 buf} {
+    when pwd_len > 64 {
+      true -> {
+        let h = sha256(password pwd_len)
+        ret { 32 h }
+      }
+      false -> { ret { pwd_len password } }
+    }
+  }
+}
+
+max_i is { a i64 b i64 -> ret i64 { when a >= b { true -> { ret a } _ -> { ret b } } } }
+
+// Outer loop: produce `blocks` 32-byte T_i values, write each into
+// dk[(i)*32..], truncating the final block to fit dk_len.
 derive_blocks is {
-  password buf pwd_len i64
-  salt buf salt_len i64
-  iters i64
-  dk buf
-  i i64
-  blocks i64
-  dk_len i64 -> ret i64 {
+  salt buf salt_len i64 iters i64 dk buf i i64 blocks i64 dk_len i64
+  ipad_block buf opad_block buf salt_int buf u_a buf u_b buf t buf
+  inner_in buf inner_h buf outer_in buf k_tbl buf w buf st buf pad buf -> ret i64 {
     when i >= blocks {
       true -> { ret 0 }
       false -> {
         let block_idx = i + 1
-        let t = derive_block(password pwd_len salt salt_len iters block_idx)
+        // U_1 = HMAC(key, salt || INT_BE32(block_idx))
+        rt_copy_bytes(salt_int 0 salt 0 salt_len)
+        set_be32(salt_int salt_len block_idx)
+        hmac_sha256_into(u_a ipad_block opad_block salt_int salt_len + 4
+                         inner_in inner_h outer_in k_tbl w st pad)
+        rt_copy_bytes(t 0 u_a 0 32)
+        // T_i = U_1 ^ U_2 ^ ... ^ U_iters
+        iterate_u(t u_a u_b 1 iters
+                  ipad_block opad_block inner_in inner_h outer_in k_tbl w st pad)
         let off = i * 32
         let take = remaining_take(dk_len off)
         rt_copy_bytes(dk off t 0 take)
-        self(password pwd_len salt salt_len iters dk i + 1 blocks dk_len)
+        self(salt salt_len iters dk i + 1 blocks dk_len
+             ipad_block opad_block salt_int u_a u_b t
+             inner_in inner_h outer_in k_tbl w st pad)
       }
     }
   }
 }
 
-// How many bytes of the current 32-byte T_i block belong in the
-// final DK — the last block may be partial (`dk_len % 32` != 0).
+// How many bytes of the current 32-byte T_i block belong in DK.
 remaining_take is {
   dk_len i64 off i64 -> ret i64 {
     let left = dk_len - off
@@ -63,41 +120,22 @@ remaining_take is {
   }
 }
 
-// One T_i block: U_1 = HMAC(pw, salt || INT_BE32(i));
-//                U_j = HMAC(pw, U_{j-1})  for j > 1;
-//                T_i = U_1 XOR U_2 XOR ... XOR U_iters.
-derive_block is {
-  password buf pwd_len i64
-  salt buf salt_len i64
-  iters i64
-  block_idx i64 -> ret buf {
-    // Build salt || INT_BE32(block_idx) — first HMAC input.
-    let u_in = alloc_or_die(salt_len + 4)
-    rt_copy_bytes(u_in 0 salt 0 salt_len)
-    set_be32(u_in salt_len block_idx)
-    let u1 = hmac_sha256(password pwd_len u_in salt_len + 4)
-    // Accumulator (T) starts as a copy of U_1; subsequent U's get
-    // XOR'd in by `iterate_u`.
-    let t = alloc_or_die(32)
-    rt_copy_bytes(t 0 u1 0 32)
-    iterate_u(password pwd_len u1 t 1 iters)
-    ret t
-  }
-}
-
-// Iterations U_2..U_iters: each U_j = HMAC(pw, U_{j-1}); XOR into t.
+// Iterations U_2..U_iters.  `u_prev`/`u_tmp` ping-pong: each step
+// computes U_j into u_tmp from u_prev, XORs it into t, then swaps
+// the two buffer roles for the next iteration.  No allocation.
 iterate_u is {
-  password buf pwd_len i64
-  u_prev buf
-  t buf
-  j i64
-  iters i64 -> ret i64 {
+  t buf u_prev buf u_tmp buf j i64 iters i64
+  ipad_block buf opad_block buf inner_in buf inner_h buf outer_in buf
+  k_tbl buf w buf st buf pad buf -> ret i64 {
     when j >= iters {
       true -> { ret 0 }
       false -> {
-        let u_next = hmac_sha256(password pwd_len u_prev 32)
-        xor_into(t u_next 0 32)
-        self(password pwd_len u_next t j + 1 iters)
+        hmac_sha256_into(u_tmp ipad_block opad_block u_prev 32
+                         inner_in inner_h outer_in k_tbl w st pad)
+        xor_into(t u_tmp 0 32)
+        // Swap u_prev <-> u_tmp for the next round.
+        self(t u_tmp u_prev j + 1 iters
+             ipad_block opad_block inner_in inner_h outer_in k_tbl w st pad)
       }
     }
   }
@@ -111,8 +149,7 @@ xor_into is {
       false -> {
         let a = at(t i)
         let b = at(src i)
-        let r = a ^ b
-        set(t i r)
+        set(t i a ^ b)
         self(t src i + 1 end)
       }
     }

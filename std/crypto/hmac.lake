@@ -8,7 +8,7 @@
 // see `benchmark/test/hmac_kat.lake` (TODO).
 
 +std.bytes.{ at set }
-+std.crypto.sha256.{ sha256 }
++std.crypto.sha256.{ sha256 sha256_into }
 +std.process.{ alloc_or_die }
 @rt(rt_copy_bytes)
 
@@ -34,6 +34,42 @@ pub hmac_sha256 is {
   }
 }
 
+// ── zero-alloc HMAC (#156 followup) ──────────────────────────
+//
+// PBKDF2 runs HMAC thousands of times with a FIXED key, so the two
+// padded key blocks (k⊕ipad, k⊕opad) are constant across the loop.
+// The caller builds them once via `build_padded_block` and threads
+// the rest of the scratch here.  Allocates nothing.
+//
+// HMAC = SHA-256( opad_block || SHA-256( ipad_block || msg ) )
+//
+// Scratch the caller must supply (reused every call):
+//   ipad_block, opad_block : 64 B each (pre-XOR'd key blocks)
+//   inner_in               : 64 + max(msg_len) B
+//   inner_h                : 32 B
+//   outer_in               : 96 B
+//   k_tbl                  : 256 B (sha256 round constants)
+//   w                      : 256 B ; st : 32 B
+//   pad                    : >= padded_cap(max(64+msg_len, 96)) B
+// Result digest is written into `out` (32 B).
+pub hmac_sha256_into is {
+  out buf
+  ipad_block buf opad_block buf
+  msg buf msg_len i64
+  inner_in buf inner_h buf outer_in buf
+  k_tbl buf w buf st buf pad buf -> ret i64 {
+    // inner = sha256( ipad_block || msg )
+    rt_copy_bytes(inner_in 0 ipad_block 0 64)
+    rt_copy_bytes(inner_in 64 msg 0 msg_len)
+    sha256_into(inner_h inner_in 64 + msg_len k_tbl w st pad)
+    // outer = sha256( opad_block || inner )
+    rt_copy_bytes(outer_in 0 opad_block 0 64)
+    rt_copy_bytes(outer_in 64 inner_h 0 32)
+    sha256_into(out outer_in 96 k_tbl w st pad)
+    ret 0
+  }
+}
+
 // Returns `{ effective_len, buf }`.  When `key_len > 64`, replaces
 // the key with its 32-byte SHA-256 hash; otherwise hands back the
 // original key with its real length.  The tuple shape mirrors
@@ -54,7 +90,7 @@ normalize_key is {
 // the rest zero (rt_allocate-backed pages are mmap'd, so the tail
 // is already 0x00), then XOR every byte with `pad` (0x36 ipad /
 // 0x5C opad).
-build_padded_block is {
+pub build_padded_block is {
   key buf key_len i64 pad i64 -> ret buf {
     let block = alloc_or_die(64)
     rt_copy_bytes(block 0 key 0 key_len)

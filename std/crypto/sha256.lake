@@ -349,6 +349,123 @@ hash_blocks is {
   }
 }
 
+// ── zero-alloc variants (#156 followup) ──────────────────────
+//
+// PBKDF2 calls HMAC (→ sha256) thousands of times in a tight
+// self-loop.  Each plain `sha256` call allocates h/padded/k_tbl/w/st,
+// and sync ret-machines inherit the caller's arena with no per-call
+// reclaim — so the arena exhausts after ~50-100 iterations and the
+// accumulator corrupts (#156).  The `_into` chain below allocates
+// NOTHING: every scratch buffer is supplied by the caller and reused
+// across iterations.  `w`, `st`, `padded` are over-sized once by the
+// top-level caller and threaded down.
+//
+// `zero_range(b, i, end)` — write 0x00 to b[i..end].  Reused scratch
+// is not mmap-zeroed like a fresh rt_allocate page, so the padding
+// gap must be cleared explicitly.
+zero_range is {
+  b buf i i64 end i64 -> ret i64 {
+    when i >= end {
+      true -> { ret 0 }
+      _ -> {
+        set(b i 0)
+        self(b i + 1 end)
+      }
+    }
+  }
+}
+
+// Like `build_padded` but writes into a caller-provided `dst`
+// (capacity must be >= padded_len(len)).  Zeros the gap explicitly.
+build_padded_into is {
+  dst buf src buf len i64 -> ret i64 {
+    let total = padded_len(len)
+    rt_copy_bytes(dst 0 src 0 len)
+    set(dst len 0x80)
+    zero_range(dst len + 1 total - 8)
+    let bits = len << 3
+    set_be32(dst total - 8 bits >> 32 & 0xffffffff)
+    set_be32(dst total - 4 bits & 0xffffffff)
+    ret 0
+  }
+}
+
+// Like `process_block` but uses caller-supplied `w` (256 B) and
+// `st` (32 B) scratch instead of allocating them.
+process_block_into is {
+  buf buf off i64 h buf k_tbl buf w buf st buf -> ret i64 {
+    rt_copy_bytes(w 0 buf off 64)
+    fill_w(w 16)
+    let a0 = be32(h 0)
+    let b0 = be32(h 4)
+    let c0 = be32(h 8)
+    let d0 = be32(h 12)
+    let e0 = be32(h 16)
+    let f0 = be32(h 20)
+    let g0 = be32(h 24)
+    let h0 = be32(h 28)
+    compress(st w k_tbl 0 a0 b0 c0 d0 e0 f0 g0 h0)
+    set_be32(h 0  add32(a0 be32(st 0)))
+    set_be32(h 4  add32(b0 be32(st 4)))
+    set_be32(h 8  add32(c0 be32(st 8)))
+    set_be32(h 12 add32(d0 be32(st 12)))
+    set_be32(h 16 add32(e0 be32(st 16)))
+    set_be32(h 20 add32(f0 be32(st 20)))
+    set_be32(h 24 add32(g0 be32(st 24)))
+    set_be32(h 28 add32(h0 be32(st 28)))
+    ret 0
+  }
+}
+
+hash_blocks_into is {
+  buf buf total i64 off i64 h buf k_tbl buf w buf st buf -> ret i64 {
+    when off == total {
+      true -> { ret 0 }
+      _    -> {
+        process_block_into(buf off h k_tbl w st)
+        self(buf total (off + 64) h k_tbl w st)
+      }
+    }
+  }
+}
+
+// Zero-alloc SHA-256.  Writes the 32-byte digest into `h` (caller-
+// owned).  `k_tbl` (256 B constant), `w` (256 B), `st` (32 B) and
+// `padded` (>= padded_len(len) B) are caller-supplied scratch.
+pub sha256_into is {
+  h buf src buf len i64 k_tbl buf w buf st buf padded buf -> ret i64 {
+    set_be32(h 0  h_init(0))
+    set_be32(h 4  h_init(1))
+    set_be32(h 8  h_init(2))
+    set_be32(h 12 h_init(3))
+    set_be32(h 16 h_init(4))
+    set_be32(h 20 h_init(5))
+    set_be32(h 24 h_init(6))
+    set_be32(h 28 h_init(7))
+    build_padded_into(padded src len)
+    let total = padded_len(len)
+    hash_blocks_into(padded total 0 h k_tbl w st)
+    ret 0
+  }
+}
+
+// Build the 64-entry round-constant table into a caller-supplied
+// 256-byte buffer.  Exposed so callers that hash repeatedly build
+// it once and reuse.
+pub fill_k_table is {
+  k buf -> ret i64 {
+    let src = init_k_table(0)
+    rt_copy_bytes(k 0 src 0 256)
+    ret 0
+  }
+}
+
+// `padded_cap(len)` — public helper so callers can size the
+// `padded` scratch buffer for `sha256_into`.
+pub padded_cap is {
+  len i64 -> ret i64 { ret padded_len(len) }
+}
+
 // ── public entry point ───────────────────────────────────────
 //
 // Usage:
