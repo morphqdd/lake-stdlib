@@ -28,7 +28,7 @@ check is {
 
 main is {
   _ -> {
-    let v = vec_new()
+    let v Vec[i64] = vec_new()
     let v2 = fill(v 0)
     when vec_len(v2) == 100 {
       true -> {
