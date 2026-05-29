@@ -1,22 +1,6 @@
-// String building helpers.  Each `concat*` allocates a fresh
-// fat-ptr buffer and copies the source bytes via `rt_copy_bytes`,
-// the bounds-checked memcpy primitive shipped with the compiler.
-// Returned value is a fat-ptr (i64 at the ABI level) pointing at the
-// concatenated payload — same shape as a `str` literal, so it can
-// be passed straight to `rt_write`, `rt_send_async`, `len`, etc.
-//
-// All wrappers are `ret`-typed so they compose with `let` and `pin`.
-//
-// `rt_allocate` returns `{atom buf}` under the tuple ABI (#87) —
-// callers pattern-match on `r.0` and dispatch.  On `:err` we call
-// `+std.process.die` (a Phase 2a-inlined wrapper over `rt_die_actor`)
-// so the scheduler removes the dying actor cleanly at the next
-// quantum boundary.  The synthesised `ret r.1` after `die()` is
-// dead code path-wise but required for the ret-machine return-type
-// check.
-//
-// For a slower but rt_copy_bytes-free implementation see
-// `std/experimental/strings.lake`.
+// String building helpers.  Each `concat*` allocates a fresh buf and
+// copies via `rt_copy_bytes`; the result is a fat-ptr usable anywhere
+// a `str` is (rt_write, len, send).  All wrappers are ret-typed.
 
 +std.process.{ die }
 +std.bytes.{ size trim }
@@ -27,11 +11,8 @@
 @rt(len)
 @rt(cmp_str_buf)
 
-// `eq_buf(s, b)` — 1 iff the `str` literal `s` is byte-for-byte
-// identical to the `buf` `b`.  Lake distinguishes `str` from `buf`
-// in the type system (#45); this helper bridges the two for argv
-// matches against compile-time command names without any
-// allocation (the rt-fn walks the two fat-pointers in place).
+// `eq_buf(s, b)` — 1 iff `str` `s` byte-matches `buf` `b`.  Bridges
+// the str/buf type split (#45) for alloc-free argv comparisons.
 pub eq_buf is {
   s str b buf -> ret i64 { ret cmp_str_buf(s b) }
 }
@@ -336,11 +317,8 @@ pub to_upper is {
 
 // ── trim ─────────────────────────────────────────────────────────
 
-// Whitespace check — space (0x20), tab (0x09), newline (0x0A),
-// carriage return (0x0D).  Matches the conservative POSIX
-// definition used by most line readers.  Single-Ret body via
-// bitwise OR of equality comparisons keeps it inline-able under
-// the simple-pure rule.
+// Whitespace check — space, tab, newline, carriage return.  Body is
+// a single OR of equalities so it stays inline-able (simple-pure).
 pub is_ws_byte is {
   b i64 -> ret i64 {
     ret (b == 32) | (b == 9) | (b == 10) | (b == 13)
@@ -468,10 +446,7 @@ pub int_to_buf_write is {
   }
 }
 
-// Reverse-fill digits at the tail, then shift left to the
-// caller's offset.  Simpler approach: write digits in reverse
-// at the END of a 20-byte buffer, then memmove.  We instead use
-// a length counter + post-reverse in place.
+// Write digits in reverse from `off`, then reverse in place.
 pub int_digits_fwd is {
   dst buf n i64 off i64 -> ret i64 {
     let count = int_digits_write_rev(dst n off)

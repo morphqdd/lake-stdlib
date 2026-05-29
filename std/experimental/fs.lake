@@ -1,27 +1,7 @@
 // Direct-syscall filesystem wrappers — open / read / close / mkdir.
-//
-// The `experimental.sys` module exposes `rt_syscall` and the
-// numeric SYS_* constants; this module gives them a Lake-typed
-// surface that returns `{atom i64}` tuples so callers can decide
-// whether a failed open kills their actor or routes through an
-// error-handling branch:
-//
-//     +std.experimental.fs.{ open close O_RDONLY }
-//     let r = open(path 0 0)
-//     when r.0 {
-//       :ok  -> { let fd = r.1 ; … ; close(fd) }
-//       :err -> { eprintln("open failed") }
-//     }
-//
-// Path arguments are Lake `buf` values — they don't need to be
-// null-terminated by the caller; each helper appends the trailing
-// `\0` itself before handing the bytes to the kernel.
-//
-// Error convention (matches `rt_allocate`):
-//   {:ok n}     — n is the kernel return value (fd, bytes-read, 0
-//                 for mkdir/close).
-//   {:err code} — code is the positive errno (e.g. 2 = ENOENT,
-//                 13 = EACCES, 17 = EEXIST).
+// Returns `{atom i64}`: `{:ok n}` (fd / bytes-read / 0) or
+// `{:err errno}` (positive errno).  Path bufs need not be
+// null-terminated; each helper appends the `\0` itself.
 
 +std.experimental.sys.{ SYS_READ SYS_WRITE SYS_OPEN SYS_CLOSE SYS_MKDIR }
 +std.process.{ alloc_or_die }
@@ -45,17 +25,9 @@ pub const MODE_644 = 420
 
 // ── helpers ──────────────────────────────────────────────────────
 
-// Allocate a `(buf_len(p) + 1)`-byte buffer, copy `p`, then write
-// a trailing 0 — yielding a null-terminated cstring suitable for
-// any path argument of a Linux syscall.  Public so the experimental
-// `process` module can reuse it when building exec's argv array.
-//
-// `pin set(...)` is critical: even though `std.bytes.set` is
-// ret-typed, a bare statement call goes through the async spawn
-// path (`pin` is the explicit sync-let sugar — see #39).  Without
-// it the null terminator would land *after* `ret c` returns, and
-// downstream `execve` / `open` calls would walk past the path's
-// real end into uninitialised memory and SIGSEGV.
+// Null-terminated copy of `p` for syscall path args.  `pin set(...)`
+// is required: a bare call is async (#39), so the terminator must be
+// forced to land before `ret c` or callers walk past the path end.
 pub cstr_of is {
   p buf -> ret buf {
     let n = size(p)
@@ -141,10 +113,8 @@ pub write is {
   }
 }
 
-// write_str(fd, s) — convenience for str literals.  `rt_str_ptr`
-// + `len` give us the raw byte span; the type system distinguishes
-// str from buf (#45) so we can't route through the `write` buf
-// helper without an extra copy.
+// write_str(fd, s) — str-literal variant (str/buf are distinct, #45,
+// so this can't route through `write` without a copy).
 pub write_str is {
   fd i64 s str -> ret {atom i64} {
     let r = rt_syscall(SYS_WRITE fd rt_str_ptr(s) len(s) 0 0 0)

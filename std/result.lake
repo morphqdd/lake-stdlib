@@ -1,0 +1,36 @@
+// Success (`Ok`) or failure (`Err`) outcome.
+
+Result[T E] is enum {
+  Ok(T)
+  Err(E)
+}
+
+// True when `r` is `Ok`.
+pub is_ok[T E] is {
+  r Result[T E] -> ret i64 {
+    when r {
+      Ok(_)  -> { ret 1 }
+      Err(_) -> { ret 0 }
+    }
+  }
+}
+
+// True when `r` is `Err`.
+pub is_err[T E] is {
+  r Result[T E] -> ret i64 {
+    when r {
+      Ok(_)  -> { ret 0 }
+      Err(_) -> { ret 1 }
+    }
+  }
+}
+
+// Inner `Ok` value, else the fallback `d`.
+pub unwrap_or[T E] is {
+  r Result[T E] d T -> ret T {
+    when r {
+      Ok(v)  -> { ret v }
+      Err(_) -> { ret d }
+    }
+  }
+}

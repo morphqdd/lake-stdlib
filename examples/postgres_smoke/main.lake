@@ -1,0 +1,102 @@
+// Postgres MVP smoke test.
+//
+// Spin up a server with:
+//   docker run --rm -p 5432:5432 -e POSTGRES_PASSWORD=test \
+//       postgres:16-alpine
+//
+// Then build + run this example.  It connects, runs a simple query,
+// runs a prepared statement, then closes.
+//
+// See docs/state/features/154_postgres_client.md for what works /
+// what's stubbed.
+
++std.postgres.{ connect close query prepare execute Conn Rows Stmt
+                row_count col_count row_field
+                ip_v4 args2 error_message }
++std.postgres.types.{ enc_int4 dec_int4 dec_text dec_bool }
++std.io.{ println eprintln println_buf }
++std.process.{ arena_alloc die }
++std.strings.{ int_to_buf }
++std.bytes.{ size }
+
+@rt(rt_copy_bytes)
+
+// Static-buf helper — copy a literal into a heap buf for fns that
+// only take buf.
+sbuf is {
+  s str n i64 -> ret buf {
+    let b = arena_alloc(n)
+    rt_copy_bytes(b 0 s 0 n)
+    ret b
+  }
+}
+
+main is {
+  _ -> {
+    let host = ip_v4(127 0 0 1)
+    let user = sbuf("forkast" 7)
+    let db = sbuf("forkast" 7)
+    let password = sbuf("forkast" 7)
+    pin println("pg smoke: connecting…")
+    let c = connect(host 5432 user db password)
+    when c.ok {
+      1 -> {
+        pin println("pg smoke: connected, running SELECT")
+        let rows = query(c "SELECT 1::int4, 'hello'::text, true::bool")
+        when rows.ok {
+          1 -> {
+            let n = row_count(rows)
+            pin println_buf(int_to_buf(n))
+            when n {
+              1 -> {
+                let f0 = row_field(rows 0 0)
+                let v0 = dec_int4(f0 0)
+                let f1 = row_field(rows 0 1)
+                let f2 = row_field(rows 0 2)
+                let v2 = dec_bool(f2 0)
+                pin println("col0 (int4):")
+                pin println_buf(int_to_buf(v0))
+                pin println("col1 (text):")
+                pin println_buf(f1)
+                pin println("col2 (bool):")
+                pin println_buf(int_to_buf(v2))
+              }
+              _ -> { pin eprintln("pg smoke: expected 1 row") }
+            }
+          }
+          _ -> {
+            let m = error_message(rows.err_msg)
+            pin eprintln("pg smoke: query error:")
+            pin println_buf(m)
+          }
+        }
+        // Extended query: SELECT $1::int4 + $2::int4
+        pin println("pg smoke: preparing add stmt")
+        let stmt = prepare(c "add_stmt" "SELECT $1::int4 + $2::int4")
+        when stmt.ok {
+          1 -> {
+            let a = enc_int4(40)
+            let b = enc_int4(2)
+            let args = args2(a b)
+            let rows2 = execute(c stmt args)
+            when rows2.ok {
+              1 -> {
+                let f = row_field(rows2 0 0)
+                let v = dec_int4(f 0)
+                pin println("pg smoke: 40 + 2 =")
+                pin println_buf(int_to_buf(v))
+              }
+              _ -> { pin eprintln("pg smoke: execute failed") }
+            }
+          }
+          _ -> { pin eprintln("pg smoke: prepare failed") }
+        }
+        close(c)
+        pin println("pg smoke: done")
+      }
+      _ -> {
+        pin eprintln("pg smoke: connect failed (is postgres on :5432?)")
+      }
+    }
+  }
+}

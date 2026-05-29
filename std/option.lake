@@ -1,0 +1,36 @@
+// Optional value — presence (`Some`) or absence (`None`).
+
+Option[T] is enum {
+  Some(T)
+  None
+}
+
+// True when `o` carries a value.
+pub is_some[T] is {
+  o Option[T] -> ret i64 {
+    when o {
+      Some(_) -> { ret 1 }
+      None    -> { ret 0 }
+    }
+  }
+}
+
+// True when `o` is `None`.
+pub is_none[T] is {
+  o Option[T] -> ret i64 {
+    when o {
+      Some(_) -> { ret 0 }
+      None    -> { ret 1 }
+    }
+  }
+}
+
+// Inner value if present, else the fallback `d`.
+pub unwrap_or[T] is {
+  o Option[T] d T -> ret T {
+    when o {
+      Some(v) -> { ret v }
+      None    -> { ret d }
+    }
+  }
+}

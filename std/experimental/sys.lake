@@ -1,37 +1,111 @@
-// Linux x86_64 syscall numbers and the thinnest possible wrappers
-// over the raw `rt_syscall` runtime primitive.  Use this module when
-// you want direct kernel-call control without the bounds-checked
-// helpers (`rt_write`, `rt_recv_async`, …) shipped with the
-// compiler.
+// Linux syscall numbers and the thinnest possible wrappers over the
+// raw `rt_syscall` runtime primitive.  Use this module when you want
+// direct kernel-call control without the bounds-checked helpers
+// (`rt_write`, `rt_recv_async`, …) shipped with the compiler.
 //
 // Trade-off: zero abstraction overhead, but also zero safety net.
 // `rt_syscall` is unbounded — passing a stale buffer pointer or the
 // wrong length will crash or silently corrupt memory.  See
 // `experimental/README.md` for the boundary between this module and
 // the regular stdlib I/O.
+//
+// Syscall numbers differ between architectures, so each is declared
+// twice behind `@cfg(arch="...")` (feature #054/#055): the compiler's
+// cfg-filter keeps only the variant matching the `--target` and drops
+// the other before name resolution, so the const name resolves to the
+// arch-correct number with no collision.
 
 @rt(rt_syscall)
 
-// ── Linux x86_64 syscall numbers ────────────────────────────────
+// ── Linux syscall numbers ───────────────────────────────────────
 //
-// Source: arch/x86/entry/syscalls/syscall_64.tbl in the Linux tree.
-// We expose only the ones that the experimental stdlib uses today;
-// adding more is a one-line edit.
-pub const SYS_READ      = 0
-pub const SYS_WRITE     = 1
-pub const SYS_OPEN      = 2
-pub const SYS_CLOSE     = 3
-pub const SYS_LSEEK     = 8
-pub const SYS_MMAP      = 9
-pub const SYS_BRK       = 12
-pub const SYS_GETPID    = 39
-pub const SYS_EXIT      = 60
-pub const SYS_MKDIR     = 83
-pub const SYS_FORK      = 57
-pub const SYS_EXECVE    = 59
-pub const SYS_WAIT4     = 61
+// x86_64 source: arch/x86/entry/syscalls/syscall_64.tbl.
+// aarch64 source: asm-generic/unistd.h (arm64 uses the kernel's
+//   "generic" table).  Legacy x86_64-only calls map to their
+//   generic-ABI replacements on aarch64:
+//     SYS_OPEN  → openat   (56) — extra dirfd arg (AT_FDCWD = -100)
+//     SYS_MKDIR → mkdirat  (34) — extra dirfd arg
+//     SYS_FORK  → clone    (220)
+//   Callers targeting aarch64 must use the *at-family calling
+//   convention for these; the number alone is not drop-in.
 
-// open(2) flags (asm-generic/fcntl.h).  Only the common subset:
+@cfg(arch="x86_64")
+pub const SYS_READ      = 0
+@cfg(arch="aarch64")
+pub const SYS_READ      = 63
+
+@cfg(arch="x86_64")
+pub const SYS_WRITE     = 1
+@cfg(arch="aarch64")
+pub const SYS_WRITE     = 64
+
+@cfg(arch="x86_64")
+pub const SYS_OPEN      = 2
+@cfg(arch="aarch64")
+pub const SYS_OPEN      = 56
+
+@cfg(arch="x86_64")
+pub const SYS_CLOSE     = 3
+@cfg(arch="aarch64")
+pub const SYS_CLOSE     = 57
+
+@cfg(arch="x86_64")
+pub const SYS_LSEEK     = 8
+@cfg(arch="aarch64")
+pub const SYS_LSEEK     = 62
+
+@cfg(arch="x86_64")
+pub const SYS_MMAP      = 9
+@cfg(arch="aarch64")
+pub const SYS_MMAP      = 222
+
+@cfg(arch="x86_64")
+pub const SYS_BRK       = 12
+@cfg(arch="aarch64")
+pub const SYS_BRK       = 214
+
+@cfg(arch="x86_64")
+pub const SYS_GETPID    = 39
+@cfg(arch="aarch64")
+pub const SYS_GETPID    = 172
+
+@cfg(arch="x86_64")
+pub const SYS_SOCKET    = 41
+@cfg(arch="aarch64")
+pub const SYS_SOCKET    = 198
+
+@cfg(arch="x86_64")
+pub const SYS_CONNECT   = 42
+@cfg(arch="aarch64")
+pub const SYS_CONNECT   = 203
+
+@cfg(arch="x86_64")
+pub const SYS_EXIT      = 60
+@cfg(arch="aarch64")
+pub const SYS_EXIT      = 93
+
+@cfg(arch="x86_64")
+pub const SYS_MKDIR     = 83
+@cfg(arch="aarch64")
+pub const SYS_MKDIR     = 34
+
+@cfg(arch="x86_64")
+pub const SYS_FORK      = 57
+@cfg(arch="aarch64")
+pub const SYS_FORK      = 220
+
+@cfg(arch="x86_64")
+pub const SYS_EXECVE    = 59
+@cfg(arch="aarch64")
+pub const SYS_EXECVE    = 221
+
+@cfg(arch="x86_64")
+pub const SYS_WAIT4     = 61
+@cfg(arch="aarch64")
+pub const SYS_WAIT4     = 260
+
+// open(2) flags (asm-generic/fcntl.h — shared by x86_64 and arm64,
+// so these are arch-invariant and need no `@cfg`).  Common subset:
 pub const O_RDONLY      = 0
 pub const O_WRONLY      = 1
 pub const O_RDWR        = 2

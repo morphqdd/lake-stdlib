@@ -1,22 +1,6 @@
-// All I/O machines are ret-typed.  By default a bare call is async
-// (fire-and-forget — the implicit caller pid is the null sentinel
-// `0`, which `send_expr` silently drops):
-//
-//     println("hello")        // returns immediately, output
-//                             // ordering is whatever the
-//                             // scheduler picks
-//
-// To force sequential output use `pin`:
-//
-//     pin println("first")
-//     pin println("second")   // "first" appears before "second"
-//
-// `pin <expr>` is sugar for `let __pin_<id> = <expr>` — same
-// machinery, just no useless binding.  Use `let r = …` instead
-// when you want to capture the returned value.
-//
-// The sync path costs one mailbox roundtrip per call (~µs on the
-// current scheduler); the async path is the cheap default.
+// I/O machines are ret-typed.  A bare call is async (fire-and-forget,
+// scheduler-ordered output); prefix with `pin` to force sequential
+// execution — `pin println(...)`.
 
 +std.bytes.{ size }
 
@@ -54,10 +38,8 @@ pub eprintln is {
 }
 
 // ── buf-valued variants ────────────────────────────────────────
-//
-// `print`/`println` take a `str` (compile-time literal or
-// `concat*` output).  Runtime byte buffers (`argv` entries, file
-// reads) come back as `buf`; these helpers cover that path.
+// `print`/`println` take `str`; these cover runtime `buf` values
+// (argv entries, file reads).
 
 pub print_buf is {
   b buf -> ret i64 {

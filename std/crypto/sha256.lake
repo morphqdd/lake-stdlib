@@ -1,36 +1,11 @@
 // SHA-256 in pure Lake — FIPS 180-4.
-//
-// Public surface:
-//   pub sha256(buf i64 len i64)        -> ret i64   // returns fat-ptr to 32-byte digest
-//
-// Implementation notes:
-//   * No NOT operator in Lake — every `~x` reads as `x ^ -1`.
-//   * No runtime arrays — K (64 round constants) and H_init (8 IV
-//     words) are dispatched via a `when`-chain ret-machine, one
-//     constant per arm.  This compiles to a Cranelift Switch and
-//     stays O(1) per lookup.
-//   * Compression rounds carry a..h plus i as `self()` parameters;
-//     the message schedule W[64] lives on the heap (one scratch
-//     buffer per call).
-//
-//  Tested against `""`, `"abc"`, and `"a"*55..64` boundary inputs in
-//  benchmark/test/sha256_kat.lake.
+// Public: `sha256(buf len) -> buf` (32-byte digest).
+// No NOT operator in Lake — `~x` is written `x ^ -1`.
 
 +std.bytes.{ at set set_be32 be32 }
 
-// `rt_allocate` returns `{atom buf}` since the tuple-ABI refactor
-// (#87).  The crypto module unwraps via `__X_r.1` without an
-// explicit `when r.0 { :err -> ... }` because every alloc here is
-// either small (32-byte digest, 256-byte K table) or modest (1×
-// padded message buffer); under realistic workloads they never
-// hit the OOM path.  A full migration to `when r.0 { :ok -> { … }
-// _ -> { die() } }` would require nesting six `when`s through
-// `process_block` and `sha256` — that's the right shape once a
-// lowering pass injects the wrap automatically (see #87).  For
-// now: `r.1` on `:err` is the `:nomem` atom, which downstream
-// `rt_copy_bytes`/`set_be32` would dereference as a buf and
-// segfault — equivalent to actor death, just less graceful.
-
+// `rt_allocate` returns `{atom buf}`; we take `.1` directly — allocs
+// here are small and the OOM path segfaults like actor death.
 @rt(rt_allocate)
 @rt(rt_copy_bytes)
 
@@ -90,16 +65,9 @@ small_s1 is {
 }
 
 // ── round constants ─────────────────────────────────────────────
-// Sixty-four 32-bit values from FIPS 180-4 §4.2.2 (first 32 bits of
-// the fractional parts of the cube roots of the first 64 primes).
-// Lookup is O(1) — Cranelift lowers `when <int> { ... }` to a
-// Switch table.
-// Initial K constants — first 32 bits of the fractional parts of the
-// cube roots of the first 64 primes (FIPS 180-4 §4.2.2).  Hashing
-// previously fetched these via a 64-arm when-dispatched ret-machine
-// `k(i)`, which paid spawn+wait overhead per round.  We now build a
-// 64×4-byte table once and read it inline via `be32(k_tbl, i*4)` —
-// eliminates ~1M ret-machine calls per 1 MiB hashed.
+// 64 K constants from FIPS 180-4 §4.2.2 (first 32 bits of the
+// fractional parts of the cube roots of the first 64 primes), built
+// once into a table and read inline via `be32(k_tbl, i*4)`.
 init_k_table is {
   _ i64 -> ret buf {
     let __k_r = rt_allocate(64 * 4)
@@ -211,22 +179,9 @@ fill_w is {
 }
 
 // ── compression ───────────────────────────────────────────────
-// Run all 64 rounds for one block.  a..h are the working words;
-// w is the heap-buffer schedule produced by fill_w.  Returns the
-// updated (a,b,c,d,e,f,g,h) packed into vars by the calling code
-// reading them back out — this machine ends with a `ret` send
-// containing the final `a + h0`-style additions handled at top
-// level.
-//
-// We return only `0` here; the caller pins the final additions
-// after running compress to completion via tuples-by-side-effect:
-// each round writes a..h back through self(), so the *last*
-// invocation's parameters are observable through a fresh wrapper.
-//
-// To avoid that gymnastics in #66 we keep a small in-band
-// 8-word state buffer that the compress machine writes its
-// final a..h into before returning — see `state_buf` calls in
-// `process_block`.
+// Run all 64 rounds for one block.  a..h are the working words; w is
+// the schedule from fill_w.  Final a..h are written into the 8-word
+// state buffer `st` (the caller reads them back out).
 compress is {
   st buf w buf k_tbl buf i i64 a i64 b i64 c i64 d i64 e i64 f i64 g i64 h i64 -> ret i64 {
     when i == 64 {
@@ -295,23 +250,16 @@ process_block is {
 }
 
 // ── padding ──────────────────────────────────────────────────
-// FIPS 180-4 §5.1.1: append the 0x80 byte, then zeros until the
-// length ≡ 56 (mod 64), then the 64-bit big-endian message length
-// in *bits*.  The padded length is `((len + 9 + 63) / 64) * 64`.
-//
-// `padded_len(len) -> (padded_len, total_len_bytes)`: we just
-// return the padded length; bit-length is `len * 8`.
+// FIPS 180-4 §5.1.1: 0x80 byte, zeros until length ≡ 56 (mod 64),
+// then the 64-bit big-endian bit-length.
 padded_len is {
   len i64 -> ret i64 {
     ret (len + 9 + 63) & -64
   }
 }
 
-// Build the padded message and return the buffer + its length.
-// Caller frees buf when done.
-//
-// We reuse a single allocation: the input bytes are copied in,
-// then padding is written on top in place.
+// Build the padded message into a fresh buf (input bytes copied in,
+// then padding written on top).
 build_padded is {
   src buf len i64 -> ret buf {
     let total = padded_len(len)
@@ -347,6 +295,116 @@ hash_blocks is {
       }
     }
   }
+}
+
+// ── zero-alloc variants (#156) ───────────────────────────────
+// The `_into` chain allocates nothing — all scratch (w/st/padded) is
+// caller-supplied and reused, so PBKDF2's tight HMAC loop doesn't
+// exhaust the actor arena.  See docs/state/features (#156).
+
+// `zero_range(b i end)` — write 0x00 to b[i..end].  Reused scratch
+// isn't mmap-zeroed, so the padding gap must be cleared explicitly.
+zero_range is {
+  b buf i i64 end i64 -> ret i64 {
+    when i >= end {
+      true -> { ret 0 }
+      _ -> {
+        set(b i 0)
+        self(b i + 1 end)
+      }
+    }
+  }
+}
+
+// Like `build_padded` but writes into a caller-provided `dst`
+// (capacity must be >= padded_len(len)).  Zeros the gap explicitly.
+build_padded_into is {
+  dst buf src buf len i64 -> ret i64 {
+    let total = padded_len(len)
+    rt_copy_bytes(dst 0 src 0 len)
+    set(dst len 0x80)
+    zero_range(dst len + 1 total - 8)
+    let bits = len << 3
+    set_be32(dst total - 8 bits >> 32 & 0xffffffff)
+    set_be32(dst total - 4 bits & 0xffffffff)
+    ret 0
+  }
+}
+
+// Like `process_block` but uses caller-supplied `w` (256 B) and
+// `st` (32 B) scratch instead of allocating them.
+process_block_into is {
+  buf buf off i64 h buf k_tbl buf w buf st buf -> ret i64 {
+    rt_copy_bytes(w 0 buf off 64)
+    fill_w(w 16)
+    let a0 = be32(h 0)
+    let b0 = be32(h 4)
+    let c0 = be32(h 8)
+    let d0 = be32(h 12)
+    let e0 = be32(h 16)
+    let f0 = be32(h 20)
+    let g0 = be32(h 24)
+    let h0 = be32(h 28)
+    compress(st w k_tbl 0 a0 b0 c0 d0 e0 f0 g0 h0)
+    set_be32(h 0  add32(a0 be32(st 0)))
+    set_be32(h 4  add32(b0 be32(st 4)))
+    set_be32(h 8  add32(c0 be32(st 8)))
+    set_be32(h 12 add32(d0 be32(st 12)))
+    set_be32(h 16 add32(e0 be32(st 16)))
+    set_be32(h 20 add32(f0 be32(st 20)))
+    set_be32(h 24 add32(g0 be32(st 24)))
+    set_be32(h 28 add32(h0 be32(st 28)))
+    ret 0
+  }
+}
+
+hash_blocks_into is {
+  buf buf total i64 off i64 h buf k_tbl buf w buf st buf -> ret i64 {
+    when off == total {
+      true -> { ret 0 }
+      _    -> {
+        process_block_into(buf off h k_tbl w st)
+        self(buf total (off + 64) h k_tbl w st)
+      }
+    }
+  }
+}
+
+// Zero-alloc SHA-256.  Writes the 32-byte digest into `h` (caller-
+// owned).  `k_tbl` (256 B constant), `w` (256 B), `st` (32 B) and
+// `padded` (>= padded_len(len) B) are caller-supplied scratch.
+pub sha256_into is {
+  h buf src buf len i64 k_tbl buf w buf st buf padded buf -> ret i64 {
+    set_be32(h 0  h_init(0))
+    set_be32(h 4  h_init(1))
+    set_be32(h 8  h_init(2))
+    set_be32(h 12 h_init(3))
+    set_be32(h 16 h_init(4))
+    set_be32(h 20 h_init(5))
+    set_be32(h 24 h_init(6))
+    set_be32(h 28 h_init(7))
+    build_padded_into(padded src len)
+    let total = padded_len(len)
+    hash_blocks_into(padded total 0 h k_tbl w st)
+    ret 0
+  }
+}
+
+// Build the 64-entry round-constant table into a caller-supplied
+// 256-byte buffer.  Exposed so callers that hash repeatedly build
+// it once and reuse.
+pub fill_k_table is {
+  k buf -> ret i64 {
+    let src = init_k_table(0)
+    rt_copy_bytes(k 0 src 0 256)
+    ret 0
+  }
+}
+
+// `padded_cap(len)` — public helper so callers can size the
+// `padded` scratch buffer for `sha256_into`.
+pub padded_cap is {
+  len i64 -> ret i64 { ret padded_len(len) }
 }
 
 // ── public entry point ───────────────────────────────────────

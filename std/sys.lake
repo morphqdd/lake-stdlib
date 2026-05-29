@@ -1,12 +1,5 @@
-// Process-global termination.
-//
-// `exit(code)` is ret-typed so callers can sequence it with `pin`
-// — without that, a bare `exit(1)` would async-spawn and execution
-// would continue past the call site until the spawned actor
-// actually drained off the scheduler queue.  The ret-type itself
-// never resolves (rt_exit never returns); the calling actor is
-// parked until rt_exit's `SYS_exit` syscall tears the whole
-// process down.
+// Process-global termination.  `exit(code)` is ret-typed so `pin
+// exit(1)` runs synchronously; rt_exit never returns.
 
 @rt(rt_exit)
 

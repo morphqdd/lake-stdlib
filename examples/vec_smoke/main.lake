@@ -1,0 +1,43 @@
+// Phase 1 acceptance: push 100 i64s, read them back in order.
+
++std.io.{ println }
++std.vec.{ vec_new vec_push vec_get vec_len }
+
+fill is {
+  v Vec[i64] i i64 -> ret Vec[i64] {
+    when i >= 100 {
+      true -> { ret v }
+      _    -> { self(vec_push(v i * 7) i + 1) }
+    }
+  }
+}
+
+check is {
+  v Vec[i64] i i64 -> ret i64 {
+    when i >= 100 {
+      true -> { ret 1 }
+      _    -> {
+        when vec_get(v i) == i * 7 {
+          true -> { self(v i + 1) }
+          _    -> { ret 0 }
+        }
+      }
+    }
+  }
+}
+
+main is {
+  _ -> {
+    let v Vec[i64] = vec_new()
+    let v2 Vec[i64] = fill(v 0)
+    when vec_len(v2) == 100 {
+      true -> {
+        when check(v2 0) == 1 {
+          true -> { println("ok vec") }
+          _    -> { println("FAIL vec values") }
+        }
+      }
+      _ -> { println("FAIL vec len") }
+    }
+  }
+}

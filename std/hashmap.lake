@@ -1,0 +1,136 @@
+// Integer-keyed hash map, generic over the value type.
+//
+// Open addressing + linear probing.  Keys are `i64`; values are
+// pointer-sized (`V` = any Lake reference or scalar).  A separate
+// `occ` array marks live slots so 0 stays a valid key.
+//
+// Buf/string keys need a way to keep variable-length key bytes in the
+// slot table (a key arena, or a buf<->i64 reinterpret primitive) plus
+// a per-key-type hash protocol (#146) — tracked separately.  `IntMap`
+// covers id->value tables, which is the common case.
+//
+// Parallel slot arrays (each cap*8 bytes):
+//   slot_key — the i64 key
+//   slot_val — the value (V as i64)
+//   occ      — 1 if the slot is live, else 0
+
++std.bytes.{ at64 set64 }
++std.process.{ alloc_or_die }
+
+pub IntMap[V] is {
+  slot_key buf
+  slot_val buf
+  occ buf
+  cap i64
+  len i64
+}
+
+pub intmap_new[V] is {
+  _ -> ret IntMap[V] {
+    let cap = 16
+    ret IntMap(zeroed(cap) zeroed(cap) zeroed(cap) cap 0)
+  }
+}
+
+pub intmap_len[V] is {
+  m IntMap[V] -> ret i64 { ret m.len }
+}
+
+// Insert or update `k -> v`.  Thread the returned map (slot arrays /
+// capacity may change on grow).
+pub intmap_put[V] is {
+  m IntMap[V] k i64 v V -> ret IntMap[V] {
+    when m.len * 4 >= m.cap * 3 {
+      true -> { ret intmap_put(intmap_grow(m) k v) }
+      _ -> {
+        let slot = probe(m k)
+        let was = at64(m.occ slot * 8)
+        set64(m.occ slot * 8 1)
+        set64(m.slot_key slot * 8 k)
+        set64(m.slot_val slot * 8 v)
+        when was {
+          0 -> { ret IntMap(m.slot_key m.slot_val m.occ m.cap m.len + 1) }
+          _ -> { ret m }
+        }
+      }
+    }
+  }
+}
+
+// 1 if `k` is present, else 0.
+pub intmap_has[V] is {
+  m IntMap[V] k i64 -> ret i64 {
+    let slot = probe(m k)
+    ret at64(m.occ slot * 8)
+  }
+}
+
+// Value for `k`.  Caller must `intmap_has` first; a miss returns 0.
+pub intmap_get[V] is {
+  m IntMap[V] k i64 -> ret V {
+    let slot = probe(m k)
+    ret at64(m.slot_val slot * 8)
+  }
+}
+
+// ── internals ────────────────────────────────────────────────────
+
+// Linear-probe to the slot holding `k`, or the first empty slot.
+probe[V] is {
+  m IntMap[V] k i64 -> ret i64 {
+    ret probe_from(m k hash_i64(k) & (m.cap - 1))
+  }
+}
+
+probe_from[V] is {
+  m IntMap[V] k i64 i i64 -> ret i64 {
+    when at64(m.occ i * 8) {
+      0 -> { ret i }
+      _ -> {
+        when at64(m.slot_key i * 8) == k {
+          true -> { ret i }
+          _ -> { ret probe_from(m k (i + 1) & (m.cap - 1)) }
+        }
+      }
+    }
+  }
+}
+
+// Double capacity, re-insert every live entry.
+intmap_grow[V] is {
+  m IntMap[V] -> ret IntMap[V] {
+    let cap = m.cap * 2
+    let fresh = IntMap(zeroed(cap) zeroed(cap) zeroed(cap) cap 0)
+    ret rehash(m fresh 0)
+  }
+}
+
+rehash[V] is {
+  old IntMap[V] acc IntMap[V] i i64 -> ret IntMap[V] {
+    when i >= old.cap {
+      true -> { ret acc }
+      _ -> {
+        when at64(old.occ i * 8) {
+          0 -> { self(old acc i + 1) }
+          _ -> {
+            let k = at64(old.slot_key i * 8)
+            let v = at64(old.slot_val i * 8)
+            self(old intmap_put(acc k v) i + 1)
+          }
+        }
+      }
+    }
+  }
+}
+
+// Fibonacci-mix the key, then mask to keep `% cap` cheap and well
+// spread (cap is always a power of two here).
+hash_i64 is {
+  k i64 -> ret i64 {
+    ret k * -7046029254386353131 >> 32 & 0x7fffffff
+  }
+}
+
+zeroed is {
+  n i64 -> ret buf { ret alloc_or_die(n * 8) }
+}

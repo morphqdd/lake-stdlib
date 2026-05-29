@@ -1,21 +1,13 @@
 // HMAC-SHA256 — RFC 2104.  Builds on `std.crypto.sha256`.
-//
 // HMAC(K, m) = SHA-256( (K' XOR opad) || SHA-256( (K' XOR ipad) || m ) )
-//   where K' is K padded to the 64-byte block size (or its SHA-256
-//   hash if K is longer than that), ipad = 0x36 × 64, opad = 0x5C × 64.
-//
-// Verified against `hmac.HMAC(key, msg, sha256).hexdigest()` —
-// see `benchmark/test/hmac_kat.lake` (TODO).
+// K' = K padded to 64 bytes (or its hash if longer); ipad=0x36, opad=0x5C.
 
 +std.bytes.{ at set }
-+std.crypto.sha256.{ sha256 }
++std.crypto.sha256.{ sha256 sha256_into }
 +std.process.{ alloc_or_die }
 @rt(rt_copy_bytes)
 
-// SHA-256 block size — the key is XOR'd into a 64-byte buffer.
-// SHA-256 digest size — 32 bytes.
-
-// hmac_sha256(key, key_len, msg, msg_len) → 32-byte digest buffer.
+// hmac_sha256(key key_len msg msg_len) → 32-byte digest buffer.
 pub hmac_sha256 is {
   key buf key_len i64 msg buf msg_len i64 -> ret buf {
     let nk_pair = normalize_key(key key_len)
@@ -34,10 +26,31 @@ pub hmac_sha256 is {
   }
 }
 
-// Returns `{ effective_len, buf }`.  When `key_len > 64`, replaces
-// the key with its 32-byte SHA-256 hash; otherwise hands back the
-// original key with its real length.  The tuple shape mirrors
-// `{atom T}` so callers can destructure with positional `.0`/`.1`.
+// ── zero-alloc HMAC (#156) ───────────────────────────────────
+// Allocates nothing — all scratch caller-supplied and reused, with
+// the two pre-XOR'd key blocks (ipad_block/opad_block) built once by
+// the caller since PBKDF2 keeps the key fixed across the loop.
+// Digest written into `out` (32 B).
+pub hmac_sha256_into is {
+  out buf
+  ipad_block buf opad_block buf
+  msg buf msg_len i64
+  inner_in buf inner_h buf outer_in buf
+  k_tbl buf w buf st buf pad buf -> ret i64 {
+    // inner = sha256( ipad_block || msg )
+    rt_copy_bytes(inner_in 0 ipad_block 0 64)
+    rt_copy_bytes(inner_in 64 msg 0 msg_len)
+    sha256_into(inner_h inner_in 64 + msg_len k_tbl w st pad)
+    // outer = sha256( opad_block || inner )
+    rt_copy_bytes(outer_in 0 opad_block 0 64)
+    rt_copy_bytes(outer_in 64 inner_h 0 32)
+    sha256_into(out outer_in 96 k_tbl w st pad)
+    ret 0
+  }
+}
+
+// Returns `{ effective_len, buf }`.  When `key_len > 64` the key is
+// replaced by its 32-byte SHA-256 hash; otherwise passed through.
 normalize_key is {
   key buf key_len i64 -> ret {i64 buf} {
     when key_len > 64 {
@@ -50,11 +63,9 @@ normalize_key is {
   }
 }
 
-// Allocate 64 bytes, copy `key` into the first `key_len`, leave
-// the rest zero (rt_allocate-backed pages are mmap'd, so the tail
-// is already 0x00), then XOR every byte with `pad` (0x36 ipad /
-// 0x5C opad).
-build_padded_block is {
+// 64-byte block: key in the first `key_len` bytes (tail already 0x00
+// from mmap'd pages), every byte XOR'd with `pad` (0x36 / 0x5C).
+pub build_padded_block is {
   key buf key_len i64 pad i64 -> ret buf {
     let block = alloc_or_die(64)
     rt_copy_bytes(block 0 key 0 key_len)

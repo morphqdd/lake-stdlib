@@ -1,20 +1,8 @@
 // Direct-syscall process management — clone3+pidfd / execve / waitid.
-//
-// This module sits at the lowest possible level: it manipulates raw
-// kernel handles without any of the Lake scheduler's bookkeeping.
-// Use it to invoke external programs (`lakec`, `git`, …) from a
-// Lake actor; do NOT use it to spawn child Lake actors — that's
-// what the regular `spawn` keyword is for.
-//
-// After clone3 the child process inherits a *copy* of the parent's
-// scheduler / io_uring state, but ignoring it is safe because we
-// immediately call `execve` to replace the address space.  If the
-// `execve` itself fails the child exits via raw `SYS_EXIT` so it
-// never returns into Lake actor code.
-//
-// Phase 1 of #099: parent parks on io_uring POLLADD over the pidfd
-// instead of spinning wait4(WNOHANG), so peer actors keep running
-// for the full child lifetime.
+// For invoking external programs (lakec, git, …) from an actor — NOT
+// for spawning Lake actors (use `spawn`).  The child execve's
+// immediately; an execve failure exits via raw SYS_EXIT.
+// See docs/state (#099) — parent parks on pidfd POLLADD, no spin.
 
 +std.experimental.sys.{ SYS_EXECVE SYS_EXIT }
 +std.experimental.fs.{ cstr_of }
@@ -54,11 +42,8 @@ build_argv_3 is {
   }
 }
 
-// Cooperative wait: pidfd POLLADD parks the actor on the io_uring
-// CQ; when the child exits the kernel makes the pidfd readable, our
-// wake-by-user_data path resumes us, and a single non-blocking
-// waitid harvests the exit status.  No spinning, no global freeze —
-// peer actors keep running for the full child lifetime.
+// Cooperative wait: park on pidfd POLLADD, then one non-blocking
+// waitid harvests the exit status.  No spinning — peers keep running.
 wait_pidfd is {
   pidfd i64 -> ret {atom i64} {
     rt_pidfd_poll_async(pidfd)
@@ -71,16 +56,8 @@ wait_pidfd is {
   }
 }
 
-// Run `prog` with a single argv entry `a1` (so the child sees
-// argv = [prog, a1]).  Returns `{:ok exit_code}` on a clean wait,
-// `{:err errno}` if clone3 or waitid themselves failed.  An execve
-// failure in the child surfaces as `{:ok 127}` (the conventional
-// "command not found" exit status).
-//
-// Concurrency note: the parent parks on io_uring POLLADD over the
-// pidfd until the child exits — peer actors keep getting scheduled
-// for the full child lifetime.  This replaces the wait4(WNOHANG)
-// spin-loop from before #099 Phase 1.
+// Run `prog` with argv = [prog, a1].  `{:ok exit_code}` on clean wait,
+// `{:err errno}` if clone3/waitid failed; execve failure → exit 127.
 pub run is {
   prog buf a1 buf -> ret {atom i64} {
     let pc = cstr_of(prog)
@@ -93,8 +70,7 @@ pub run is {
       false -> {
         when pidfd == 0 {
           true  -> {
-            // `ev` is already a raw `char**` pointer from the asm
-            // shim — no `addr()` wrap needed.
+            // `ev` is already a raw `char**` from the asm shim.
             rt_syscall(SYS_EXECVE addr(pc) addr(av) ev 0 0 0)
             rt_syscall(SYS_EXIT 127 0 0 0 0 0)
             ret { :err 127 }
@@ -109,9 +85,7 @@ pub run is {
   }
 }
 
-// 3-argv variant of `run` — `argv = [prog, a1, a2]`.  Used for
-// shell invocations (`/bin/sh -c CMD`) and any program that needs
-// more than one positional arg.  Inherits envp from the parent.
+// 3-argv variant — `argv = [prog, a1, a2]`.  Inherits parent envp.
 pub run3 is {
   prog buf a1 buf a2 buf -> ret {atom i64} {
     let pc = cstr_of(prog)
@@ -139,10 +113,8 @@ pub run3 is {
   }
 }
 
-// Same as `run` but with caller-supplied envp.  `envp_ptr` is a
-// raw `char**` (i64 pointer to a NULL-terminated array of cstring
-// pointers).  Callers build it with `rt_store` over a fresh buf;
-// see lake-house's `cmd/build.lake` for the canonical assembly.
+// `run` with caller-supplied envp — a raw `char**` (NULL-terminated
+// cstring-pointer array built via `rt_store` over a buf).
 pub run_envp is {
   prog buf a1 buf envp_ptr i64 -> ret {atom i64} {
     let pc = cstr_of(prog)

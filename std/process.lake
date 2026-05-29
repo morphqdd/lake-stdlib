@@ -1,104 +1,42 @@
-// Process-control helpers.  Thin wrappers around the rt-fns that
-// drive scheduler-visible actor state, exposed under a stable
-// stdlib import path so user code doesn't have to sprinkle
-// `@rt(rt_die_actor)` directives.
-//
-// `die` is recognised as a pure ret-machine (rt_die_actor is in the
-// pure_rt_funcs whitelist), so #78 substitutes the call inline at
-// every use site — `pin die()` ends up as a direct `rt_die_actor`
-// invocation in the *caller's* actor context, marking the right
-// process for unlink at the next quantum boundary.  Without that
-// inline expansion the wrapper would spawn a child actor that dies
-// instead, which is not the semantics user code wants.
+// Process-control helpers — thin wrappers over the actor-state rt-fns.
+// `die` is inlined at the call site (#78 pure whitelist) so it marks
+// the *caller's* actor for unlink, not a spawned child.
 
 @rt(rt_allocate)
 @rt(rt_arena_alloc)
 @rt(rt_die_actor)
-// Global process exit lives in `std.sys.exit` — re-importing it
-// here would create a duplicate `exit` name (`std.process.exit`
-// vs `std.sys.exit`) and trigger the name-collision bug #97.
+// Global process exit lives in `std.sys.exit` (re-export here would
+// collide — bug #97).
 
-// Mark the current actor for death.  The scheduler observes
-// `exec_ctx.IS_DYING` at the next quantum tick and returns
-// STOP_DONE, unlinking the actor cleanly.  Side effects already
-// queued (sends, etc.) are retained in their respective mailboxes;
-// only the dying actor's machine fn stops executing.
-//
-// Use site:
-//
-//     +std.process.{ die }
-//     ...
-//     when r.0 {
-//       :ok -> { /* happy path */ }
-//       _   -> { die() }
-//     }
+// Mark the current actor for death; the scheduler unlinks it at the
+// next quantum tick.  Queued side effects are retained.
 pub die is {
   _ -> ret {} {
     rt_die_actor()
   }
 }
 
-// `alloc(n)` — stdlib re-export of the tuple-ABI `rt_allocate`.
-// Returns `{atom buf}`: `:ok` carries the buf in `.1`, `:err` carries
-// the reason atom (currently always `:nomem`) in `.1`.  Callers
-// pattern-match — they decide whether to recover (e.g. shrink the
-// request, fall back to a static buffer) or call `die()` to give up.
-//
-// Phase 2a (#78) recognises this body as pure (rt_allocate is on
-// the whitelist), so the call substitutes inline at the call site
-// and incurs no spawn+wait overhead vs the direct rt-call.
-//
-// Use site:
-//
-//     +std.process.{ alloc, die }
-//     ...
-//     let r = alloc(4096)
-//     when r.0 {
-//       :ok  -> { /* r.1 is a fresh buf */ }
-//       :err -> { /* fallback or `die()` */ }
-//     }
+// `alloc(n)` — re-export of `rt_allocate`.  Returns `{atom buf}`:
+// `.0` is `:ok`/`:err`, `.1` carries the buf (or `:nomem` on error).
+// Caller pattern-matches `r.0` and recovers or `die()`s.  Inlined (#78).
 pub alloc is {
   n i64 -> ret {atom buf} {
     ret rt_allocate(n)
   }
 }
 
-// `alloc_or_die(n)` — convenience wrapper that pattern-matches the
-// tuple ABI for you.  On `:ok` returns the buf directly; on `:err`
-// `die()`s the current actor and returns the `:err` atom as the
-// "buf" (never observed by callers — the actor is unlinked at the
-// next quantum tick before the bogus value can be dereferenced).
-//
-// Suitable for stdlib helpers and application code where OOM
-// recovery is out of scope — the alternative is the explicit
-// `when r.0 { :ok -> ... :err -> ... }` ladder that `alloc` gives.
-// Fix bug #76: `rt_allocate(n)` returns a raw slab chunk that the
-// caller must explicitly `rt_free`.  Stdlib helpers like `cstr_of`
-// (`std/experimental/fs.lake:62`) discard the returned buf, leaking
-// one class-(ceil_log2(n+16)-4) chunk per call.  Route through the
-// arena instead — caller's arena reclaims the buf at actor death.
-// OOM-die semantics preserved: rt_arena_alloc's fallback path
-// invokes rt_die_actor on OOM, same as the original wrapper.
+// `alloc_or_die(n)` — arena-backed alloc that `die()`s on OOM.  Routes
+// through the actor arena (#76) so the buf is reclaimed at actor death
+// rather than leaking a slab chunk per call.
 pub alloc_or_die is {
   n i64 -> ret buf {
     ret rt_arena_alloc(n)
   }
 }
 
-// `arena_alloc(n)` — bump-allocate `n` bytes from the current actor's
-// per-actor arena (feature #138).  Every allocation made via this
-// path is automatically reclaimed when the actor dies, freeing user
-// code from manually calling `rt_free` on temporary scratch buffers
-// (string slices, intermediate concat results, record literals, …).
-//
-// Falls back to `rt_allocate_raw` when the arena is exhausted (default
-// 64 KB per actor) or absent (`init_main_process` doesn't allocate
-// an arena).  Failure in the fallback path dies the actor — same
-// semantics as `alloc_or_die`.
-//
-// Trade-off vs `alloc`: no `:err` tuple to pattern-match — failures
-// crash the actor.  Use when you want concise code AND auto-cleanup,
-// not when you need recoverable OOM handling.
+// `arena_alloc(n)` — bump-allocate from the per-actor arena (#138);
+// reclaimed at actor death, no manual `rt_free`.  Falls back to a raw
+// alloc (dying on OOM) when the 64 KB arena is exhausted or absent.
 pub arena_alloc is {
   n i64 -> ret buf {
     ret rt_arena_alloc(n)

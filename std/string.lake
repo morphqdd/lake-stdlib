@@ -1,0 +1,145 @@
+// Owned, growable byte string.  `str` literals are immutable static
+// spans; `String` is a heap buffer you can append to with amortized
+// doubling.  Backed by a `buf` whose first `len` bytes are live.
+
++std.bytes.{ at set size }
++std.process.{ alloc_or_die }
+@rt(rt_copy_bytes)
+
+pub String is {
+  data buf
+  len i64
+  cap i64
+}
+
+// Empty string with a small initial capacity.
+pub str_new is {
+  _ -> ret String {
+    let cap = 16
+    let data = alloc_or_die(cap)
+    ret String(data 0 cap)
+  }
+}
+
+// Build a String from a `str` literal of length `n`.
+pub str_from is {
+  s str n i64 -> ret String {
+    let cap = grow_to(16 n)
+    let data = alloc_or_die(cap)
+    rt_copy_bytes(data 0 s 0 n)
+    ret String(data n cap)
+  }
+}
+
+// Build a String by copying `n` bytes out of a `buf`.
+pub str_from_buf is {
+  b buf n i64 -> ret String {
+    let cap = grow_to(16 n)
+    let data = alloc_or_die(cap)
+    rt_copy_bytes(data 0 b 0 n)
+    ret String(data n cap)
+  }
+}
+
+pub str_len is {
+  s String -> ret i64 { ret s.len }
+}
+
+// Byte at index `i` (0..len).  Bounds enforced by the buf check in `at`.
+pub str_at is {
+  s String i i64 -> ret i64 { ret at(s.data i) }
+}
+
+// Append one byte, growing (doubling) when full.  Returns the String;
+// `data`/`cap` may change after a grow, so thread the result.
+pub str_push is {
+  s String b i64 -> ret String {
+    when s.len >= s.cap {
+      true -> { ret str_push(str_grow(s) b) }
+      _ -> {
+        set(s.data s.len b)
+        ret String(s.data s.len + 1 s.cap)
+      }
+    }
+  }
+}
+
+// Append the live bytes of `t` onto `s`.
+pub str_append is {
+  s String t String -> ret String {
+    let need = s.len + t.len
+    when need > s.cap {
+      true -> { ret str_append(str_reserve(s need) t) }
+      _ -> {
+        rt_copy_bytes(s.data s.len t.data 0 t.len)
+        ret String(s.data need s.cap)
+      }
+    }
+  }
+}
+
+// Byte-wise equality.
+pub str_eq is {
+  a String b String -> ret i64 {
+    when a.len == b.len {
+      true -> { ret eq_loop(a.data b.data 0 a.len) }
+      _ -> { ret 0 }
+    }
+  }
+}
+
+// Expose the live bytes as a fresh `buf` of exactly `len` bytes.
+pub str_to_buf is {
+  s String -> ret buf {
+    let out = alloc_or_die(s.len)
+    rt_copy_bytes(out 0 s.data 0 s.len)
+    ret out
+  }
+}
+
+// ── internals ────────────────────────────────────────────────────
+
+// Smallest doubling of `cap` that holds at least `need` bytes.
+grow_to is {
+  cap i64 need i64 -> ret i64 {
+    when cap >= need {
+      true -> { ret cap }
+      _ -> { ret grow_to(cap * 2 need) }
+    }
+  }
+}
+
+str_grow is {
+  s String -> ret String {
+    ret str_reserve(s s.cap * 2)
+  }
+}
+
+// Ensure capacity >= `min`, reallocating + copying if needed.
+str_reserve is {
+  s String min i64 -> ret String {
+    when s.cap >= min {
+      true -> { ret s }
+      _ -> {
+        let cap = grow_to(s.cap min)
+        let data = alloc_or_die(cap)
+        rt_copy_bytes(data 0 s.data 0 s.len)
+        ret String(data s.len cap)
+      }
+    }
+  }
+}
+
+eq_loop is {
+  a buf b buf i i64 n i64 -> ret i64 {
+    when i >= n {
+      true -> { ret 1 }
+      _ -> {
+        when at(a i) == at(b i) {
+          true -> { self(a b i + 1 n) }
+          _ -> { ret 0 }
+        }
+      }
+    }
+  }
+}
