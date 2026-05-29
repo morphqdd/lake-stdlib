@@ -29,7 +29,7 @@ check is {
 main is {
   _ -> {
     let v Vec[i64] = vec_new()
-    let v2 = fill(v 0)
+    let v2 Vec[i64] = fill(v 0)
     when vec_len(v2) == 100 {
       true -> {
         when check(v2 0) == 1 {
