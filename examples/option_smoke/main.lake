@@ -1,0 +1,43 @@
+// Phase 2 acceptance: Option[T] + Result[T E] construct / match / unwrap.
+
++std.io.{ println }
++std.option.{ Option unwrap_or is_some is_none }
++std.result.{ Result is_ok is_err }
+
+main is {
+  _ -> {
+    let s = Option.Some(42)
+    let n Option[i64] = Option.None
+    when unwrap_or(s 0) == 42 {
+      true -> { println("ok some") }
+      _    -> { println("FAIL some") }
+    }
+    when unwrap_or(n 99) == 99 {
+      true -> { println("ok none") }
+      _    -> { println("FAIL none") }
+    }
+    when is_some(s) == 1 {
+      true -> { println("ok is_some") }
+      _    -> { println("FAIL is_some") }
+    }
+    when is_none(n) == 1 {
+      true -> { println("ok is_none") }
+      _    -> { println("FAIL is_none") }
+    }
+    let r Result[i64 buf] = Result.Ok(7)
+    when r {
+      Ok(v)  -> {
+        when v == 7 {
+          true -> { println("ok result") }
+          _    -> { println("FAIL result") }
+        }
+      }
+      Err(_) -> { println("FAIL result") }
+    }
+    let e Result[i64 buf] = Result.Err("boom")
+    when is_err(e) == 1 {
+      true -> { println("ok is_err") }
+      _    -> { println("FAIL is_err") }
+    }
+  }
+}

@@ -1,0 +1,60 @@
+// Growable generic vector backed by a `buf`.  Each slot is a
+// pointer-sized i64 (Lake's uniform reference/scalar ABI), so `data`
+// holds `cap * 8` bytes; `vec_push` doubles `cap` and copies when
+// `len == cap`.
+
++std.bytes.{ at64 set64 }
++std.process.{ arena_alloc }
+
+@rt(rt_copy_bytes)
+
+Vec[T] is {
+  data buf
+  len  i64
+  cap  i64
+}
+
+// Empty vector with a small initial capacity (4 slots).
+pub vec_new[T] is {
+  _ -> ret Vec[T] {
+    let cap = 4
+    let data = arena_alloc(cap * 8)
+    ret Vec(data 0 cap)
+  }
+}
+
+// Number of elements stored.
+pub vec_len[T] is {
+  v Vec[T] -> ret i64 {
+    ret v.len
+  }
+}
+
+// Element at index `i`.  Out-of-range reads trap via the buf bounds
+// check in `at64`.
+pub vec_get[T] is {
+  v Vec[T] i i64 -> ret T {
+    ret at64(v.data i * 8)
+  }
+}
+
+// Append `x`, growing (doubling cap) when full.  Returns a Vec whose
+// `data`/`cap` may differ from the input after a grow, so callers must
+// thread the returned value.
+pub vec_push[T] is {
+  v Vec[T] x T -> ret Vec[T] {
+    when v.len < v.cap {
+      true -> {
+        set64(v.data v.len * 8 x)
+        ret Vec(v.data v.len + 1 v.cap)
+      }
+      _ -> {
+        let ncap = v.cap * 2
+        let ndata = arena_alloc(ncap * 8)
+        rt_copy_bytes(ndata 0 v.data 0 v.cap * 8)
+        set64(ndata v.len * 8 x)
+        ret Vec(ndata v.len + 1 ncap)
+      }
+    }
+  }
+}
