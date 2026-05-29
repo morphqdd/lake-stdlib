@@ -8,11 +8,23 @@
 
 @rt(rt_copy_bytes)
 
+// `Index` proto — the `[]` operator.  A composite receiver `v[i]`
+// desugars to `index(v i)` only when its type carries `is Index`
+// (#146 phase 2).  `index` is the single required method; element type
+// `T` is the return.
+Index is proto {
+  index is { Self i64 -> T }
+}
+
 Vec[T] is {
   data buf
   len  i64
   cap  i64
 }
+
+// Vec opts in to `[]` via the `Index` proto; `index[T]` below is the
+// required method.
+Vec is Index
 
 // Empty vector with a small initial capacity (4 slots).
 pub vec_new[T] is {
