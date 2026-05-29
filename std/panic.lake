@@ -1,0 +1,49 @@
+// Rust-style panic — print a message to stderr, then abort the whole
+// process with exit code 101 (Rust's panic convention).  Unlike
+// `std.process.die` (which gracefully unlinks just the current actor
+// and prints nothing), `panic` signals an unrecoverable bug: louder,
+// process-wide, with a diagnostic message.
+//
+// `msg` is typed `buf` but str-literals are accepted too — str/buf
+// share the fat-ptr ABI at call sites (#45), and `size()` reads the
+// fat-ptr's length either way.  So both `panic("oops")` and
+// `panic(runtime_buf)` work.
+//
+// The trailing `loc str` is NOT written by users: the compiler injects
+// the call-site `path:line:col` (track_caller, see
+// `lake-frontend/src/panic_loc.rs`).  Output mirrors Rust's first panic
+// line: `lake: panicked at <loc>: <msg>`.
+//
+// Returns `i64` only to satisfy the type checker — `rt_exit` never
+// returns, so the trailing `ret 0` is dead.
+
++std.bytes.{ size }
+
+@rt(rt_write)
+@rt(rt_exit)
+
+// Abort the process with `msg` on stderr; `loc` is compiler-injected.
+pub panic is {
+  msg buf loc str -> ret i64 {
+    rt_write(2 "lake: panicked at " size("lake: panicked at "))
+    rt_write(2 loc size(loc))
+    rt_write(2 ": " 2)
+    rt_write(2 msg size(msg))
+    rt_write(2 "\n" 1)
+    rt_exit(101)
+    ret 0
+  }
+}
+
+// `assert(cond msg)` — panic with `msg` unless `cond` is non-zero.
+// The everyday guard: `pin assert(i < n "index out of range")`.
+// `loc` is compiler-injected; the internal `panic` forward already
+// carries it (arity 3), so the injector leaves that call untouched.
+pub assert is {
+  cond i64 msg buf loc str -> ret i64 {
+    when cond {
+      0 -> { ret panic(msg loc) }
+      _ -> { ret 0 }
+    }
+  }
+}
