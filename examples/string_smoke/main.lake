@@ -1,0 +1,17 @@
++std.io.{ println println_buf }
++std.string.{ String str_from str_push str_append str_len str_at str_eq str_to_buf str_new }
++std.strings.{ int_to_buf }
+main is { _ -> {
+  let a = str_from("hello" 5)
+  let b = str_push(a 33)
+  pin println("len (want 6):")
+  pin println_buf(int_to_buf(str_len(b)))
+  pin println("bytes:")
+  pin println_buf(str_to_buf(b))
+  let c = str_from("hello!" 6)
+  pin println("eq (want 1):")
+  pin println_buf(int_to_buf(str_eq(b c)))
+  let d = str_append(str_from("foo" 3) str_from("bar" 3))
+  pin println("append:")
+  pin println_buf(str_to_buf(d))
+}}
