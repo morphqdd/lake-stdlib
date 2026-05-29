@@ -38,6 +38,14 @@ pub vec_get[T] is {
   }
 }
 
+// `Index` proto method — `v[i]` on a non-buf receiver desugars to
+// `index(v i)` (#146).  Alias for `vec_get`.
+pub index[T] is {
+  v Vec[T] i i64 -> ret T {
+    ret vec_get(v i)
+  }
+}
+
 // Append `x`, growing (doubling cap) when full.  Returns a Vec whose
 // `data`/`cap` may differ from the input after a grow, so callers must
 // thread the returned value.
