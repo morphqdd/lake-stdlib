@@ -45,14 +45,10 @@
 
 // ── public types ────────────────────────────────────────────────
 
-// `Rows` — result of a query.  `buf_data` holds the raw concatenated
-// DataRow payloads back-to-back; `row_offsets` holds the byte offset
-// into `buf_data` at which row N begins (so row N's payload is
-// `buf_data[row_offsets[N] .. row_offsets[N+1]]`).  `n_rows` is the
-// row count, `n_cols` the per-row column count.
-//
-// Without first-class lists this is the most compact representation
-// — caller iterates via `row_count(rows)` + `row_field(rows, r, c)`.
+// `Rows` — query result.  `buf_data` concatenates DataRow payloads;
+// `row_offsets[N]` is where row N starts in it (row N spans
+// `buf_data[row_offsets[N] .. row_offsets[N+1]]`).  Iterate via
+// `row_count` + `row_field`.
 pub Rows is {
   buf_data buf
   row_offsets buf
@@ -75,12 +71,9 @@ pub Stmt is {
 }
 
 // ── connect ──────────────────────────────────────────────────────
-//
-// Opens TCP via raw socket(2) + connect(2) syscalls (Lake's runtime
-// currently exposes rt_listen_tcp for *servers* but no client dial;
-// see docs/state/features/154_postgres_client.md for the tracking
-// note).  Host MUST be a 4-octet IPv4 buf — i.e. ip_v4(127 0 0 1).
-// Once rt_connect_tcp lands we'll replace this with one rt-call.
+// Opens TCP via raw socket(2)+connect(2) (no client-dial rt-fn yet;
+// see docs/state/features/154_postgres_client.md).  Host MUST be a
+// 4-octet IPv4 buf — e.g. `ip_v4(127 0 0 1)`.
 pub connect is {
   host buf port i64 user buf db buf password buf -> ret Conn {
     // socket(AF_INET=2, SOCK_STREAM=1, IPPROTO=0)

@@ -1,16 +1,7 @@
-// Bounded byte-level access on top of the compiler-shipped
-// `rt_load_u*` / `rt_store` primitives.  Every wrapper compiles to
-// one rt-call at the IR level — this module exists for naming and
-// for composing higher-level helpers (`be32`, `set_be32`).
-//
-// The buffer arg is always a fat-pointer (`rt_allocate` return
-// value or a `str` literal — Lake collapses both to i64 at the
-// runtime ABI).  Loads / stores are bounded; an out-of-range
-// offset traps via the rt-fn's bounds check.
-//
-// For tight inner loops where a function call per byte hurts,
-// reach for the indexing operator (`buf[i]`) once it lands —
-// see task B4.
+// Bounded byte-level access over the `rt_load_u*` / `rt_store`
+// primitives.  Each wrapper is one rt-call; this module adds naming
+// and the composed `be32`/`set_be32` helpers.  Out-of-range offsets
+// trap via the rt-fn bounds check.
 
 @rt(rt_load_u8)
 @rt(rt_load_u16)
@@ -23,32 +14,22 @@
 
 // ── buf metadata ───────────────────────────────────────────────
 
-// Byte length of `b` — i.e. `end - start` of its fat-pointer
-// header.  Mirrors `len()` on `str`, but typed for `buf` (see #45
-// for why these are distinct types in the source language even
-// though they share the same fat-pointer layout at runtime).
+// Byte length of `b`.  Mirrors `len()` on `str`, typed for `buf`
+// (see #45 for why these are distinct source types).
 pub size is {
   b buf -> ret i64 { ret buf_len(b) }
 }
 
-// Raw byte address of the buf's payload (`start` field).  Needed
-// when handing a buf off to a kernel syscall that wants `char*` —
-// see `std.experimental.fs.open` for the canonical use site.
+// Raw byte address of the buf's payload — for syscalls wanting a
+// `char*` (see `std.experimental.fs.open`).
 pub addr is {
   b buf -> ret i64 { ret buf_ptr(b) }
 }
 
-// Trim a buf's reported length down to `new_len`.  `rt_allocate(n)`
-// returns a fat-pointer whose `end` reflects the allocator's
-// bucket size, not `n`; `pin trim(b, n)` after filling in `n`
-// bytes so downstream `size`/`len` callers see the user-visible
-// length.  Unbounded — passing `new_len > bucket_size` extends the
-// reported size into allocator metadata.
-//
-// Ret-typed (returns 0) so callers can use `pin trim(...)` to
-// force synchronous execution.  A non-ret variant would async-
-// spawn and the calling code would already have returned the
-// untrimmed buf before the trim landed.
+// Trim a buf's reported length to `new_len` — `rt_allocate` returns
+// a fat-pointer sized to the allocator bucket, not the request, so
+// `pin trim(b n)` after filling `n` bytes fixes `size`/`len`.
+// Unbounded: `new_len > bucket_size` reads into allocator metadata.
 pub trim is {
   b buf new_len i64 -> ret i64 {
     buf_trim(b new_len)
@@ -58,9 +39,8 @@ pub trim is {
 
 // ── byte loads ─────────────────────────────────────────────────
 
-// Read one byte from `buf` at `off`, returned as i64.
-// Equivalent to the postfix-index operator `buf[off]`; kept as a
-// named wrapper for callers that prefer a function reference.
+// Read one byte from `buf` at `off`.  Same as `buf[off]`; kept as a
+// named wrapper for callers wanting a function reference.
 pub at is {
   buf buf off i64 -> ret i64 {
     ret buf[off]
@@ -124,9 +104,7 @@ pub set64 is {
 
 // ── big-endian helpers ─────────────────────────────────────────
 
-// Read a 32-bit big-endian word — what crypto / network protocols
-// use.  Composed from four byte loads + shifts so we don't depend
-// on a dedicated rt-fn.
+// Read a 32-bit big-endian word (crypto / network byte order).
 pub be32 is {
   buf buf off i64 -> ret i64 {
     let b0 = buf[off]

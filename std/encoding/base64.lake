@@ -1,11 +1,6 @@
 // Base64 encoder / decoder — RFC 4648 standard alphabet
-// (`A..Z a..z 0..9 + /`) with `=` padding.
-//
-// Both `encode` and `decode` allocate the result buffer via
-// `std.process.alloc_or_die`.  Callers own the returned buf.
-//
-// Test vectors (RFC 4648 §10) verified against Python's `base64`
-// module — see `benchmark/test/base64_kat.lake` (TODO).
+// (`A..Z a..z 0..9 + /`) with `=` padding.  Callers own the
+// alloc_or_die'd result buffer.
 
 +std.bytes.{ at set }
 +std.process.{ alloc_or_die }
@@ -218,11 +213,8 @@ decode_loop is {
         let i1 = b64_decode_char(at(src si + 1))
         let i2 = b64_decode_char(at(src si + 2))
         let i3 = b64_decode_char(at(src si + 3))
-        // i2, i3 are already 0..63 from b64_decode_char (`=` → 64
-        // observed by the early-exit branches below), so the 0x3F
-        // mask in the pack expression is redundant — *and* would
-        // bind incorrectly under Lake's C-style precedence
-        // (`i2 & 0x3f << 6` would group as `i2 & (0x3f << 6)`).
+        // No 0x3F mask: indices are already 0..63, and `i2 & 0x3f << 6`
+        // would mis-group under C-style precedence as `i2 & (0x3f << 6)`.
         let v = i0 << 18 | i1 << 12 | i2 << 6 | i3
         let b0 = v >> 16 & 0xff
         let b1 = v >> 8 & 0xff

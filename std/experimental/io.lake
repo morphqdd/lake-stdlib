@@ -1,17 +1,6 @@
-// Direct-syscall I/O for stdout / stderr.  Each machine maps to
-// exactly one `write(2)` syscall — no bounds checks, no fat-ptr
-// indirection through `rt_write`, no scheduler hand-off through
-// io_uring.
-//
-// All four wrappers are ret-typed so the existing `pin` keyword
-// can sequence them when output ordering matters.  The fast path
-// is plain async fire-and-forget:
-//
-//     +std.experimental.io.{ println }
-//     main is { _ -> { println("hi") } }
-//
-// Equivalent to the regular `std.io` shape — but it goes straight
-// to the kernel without any intermediate runtime helper.
+// Direct-syscall stdout/stderr I/O — one `write(2)` per call, no
+// `rt_write` or io_uring hand-off.  Same shape as `std.io`; ret-typed
+// so `pin` can sequence output.
 
 +std.experimental.sys.{ SYS_WRITE FD_STDOUT FD_STDERR }
 

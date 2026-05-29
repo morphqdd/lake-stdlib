@@ -1,36 +1,11 @@
 // SHA-256 in pure Lake — FIPS 180-4.
-//
-// Public surface:
-//   pub sha256(buf i64 len i64)        -> ret i64   // returns fat-ptr to 32-byte digest
-//
-// Implementation notes:
-//   * No NOT operator in Lake — every `~x` reads as `x ^ -1`.
-//   * No runtime arrays — K (64 round constants) and H_init (8 IV
-//     words) are dispatched via a `when`-chain ret-machine, one
-//     constant per arm.  This compiles to a Cranelift Switch and
-//     stays O(1) per lookup.
-//   * Compression rounds carry a..h plus i as `self()` parameters;
-//     the message schedule W[64] lives on the heap (one scratch
-//     buffer per call).
-//
-//  Tested against `""`, `"abc"`, and `"a"*55..64` boundary inputs in
-//  benchmark/test/sha256_kat.lake.
+// Public: `sha256(buf len) -> buf` (32-byte digest).
+// No NOT operator in Lake — `~x` is written `x ^ -1`.
 
 +std.bytes.{ at set set_be32 be32 }
 
-// `rt_allocate` returns `{atom buf}` since the tuple-ABI refactor
-// (#87).  The crypto module unwraps via `__X_r.1` without an
-// explicit `when r.0 { :err -> ... }` because every alloc here is
-// either small (32-byte digest, 256-byte K table) or modest (1×
-// padded message buffer); under realistic workloads they never
-// hit the OOM path.  A full migration to `when r.0 { :ok -> { … }
-// _ -> { die() } }` would require nesting six `when`s through
-// `process_block` and `sha256` — that's the right shape once a
-// lowering pass injects the wrap automatically (see #87).  For
-// now: `r.1` on `:err` is the `:nomem` atom, which downstream
-// `rt_copy_bytes`/`set_be32` would dereference as a buf and
-// segfault — equivalent to actor death, just less graceful.
-
+// `rt_allocate` returns `{atom buf}`; we take `.1` directly — allocs
+// here are small and the OOM path segfaults like actor death.
 @rt(rt_allocate)
 @rt(rt_copy_bytes)
 
@@ -90,16 +65,9 @@ small_s1 is {
 }
 
 // ── round constants ─────────────────────────────────────────────
-// Sixty-four 32-bit values from FIPS 180-4 §4.2.2 (first 32 bits of
-// the fractional parts of the cube roots of the first 64 primes).
-// Lookup is O(1) — Cranelift lowers `when <int> { ... }` to a
-// Switch table.
-// Initial K constants — first 32 bits of the fractional parts of the
-// cube roots of the first 64 primes (FIPS 180-4 §4.2.2).  Hashing
-// previously fetched these via a 64-arm when-dispatched ret-machine
-// `k(i)`, which paid spawn+wait overhead per round.  We now build a
-// 64×4-byte table once and read it inline via `be32(k_tbl, i*4)` —
-// eliminates ~1M ret-machine calls per 1 MiB hashed.
+// 64 K constants from FIPS 180-4 §4.2.2 (first 32 bits of the
+// fractional parts of the cube roots of the first 64 primes), built
+// once into a table and read inline via `be32(k_tbl, i*4)`.
 init_k_table is {
   _ i64 -> ret buf {
     let __k_r = rt_allocate(64 * 4)
@@ -211,22 +179,9 @@ fill_w is {
 }
 
 // ── compression ───────────────────────────────────────────────
-// Run all 64 rounds for one block.  a..h are the working words;
-// w is the heap-buffer schedule produced by fill_w.  Returns the
-// updated (a,b,c,d,e,f,g,h) packed into vars by the calling code
-// reading them back out — this machine ends with a `ret` send
-// containing the final `a + h0`-style additions handled at top
-// level.
-//
-// We return only `0` here; the caller pins the final additions
-// after running compress to completion via tuples-by-side-effect:
-// each round writes a..h back through self(), so the *last*
-// invocation's parameters are observable through a fresh wrapper.
-//
-// To avoid that gymnastics in #66 we keep a small in-band
-// 8-word state buffer that the compress machine writes its
-// final a..h into before returning — see `state_buf` calls in
-// `process_block`.
+// Run all 64 rounds for one block.  a..h are the working words; w is
+// the schedule from fill_w.  Final a..h are written into the 8-word
+// state buffer `st` (the caller reads them back out).
 compress is {
   st buf w buf k_tbl buf i i64 a i64 b i64 c i64 d i64 e i64 f i64 g i64 h i64 -> ret i64 {
     when i == 64 {
@@ -295,23 +250,16 @@ process_block is {
 }
 
 // ── padding ──────────────────────────────────────────────────
-// FIPS 180-4 §5.1.1: append the 0x80 byte, then zeros until the
-// length ≡ 56 (mod 64), then the 64-bit big-endian message length
-// in *bits*.  The padded length is `((len + 9 + 63) / 64) * 64`.
-//
-// `padded_len(len) -> (padded_len, total_len_bytes)`: we just
-// return the padded length; bit-length is `len * 8`.
+// FIPS 180-4 §5.1.1: 0x80 byte, zeros until length ≡ 56 (mod 64),
+// then the 64-bit big-endian bit-length.
 padded_len is {
   len i64 -> ret i64 {
     ret (len + 9 + 63) & -64
   }
 }
 
-// Build the padded message and return the buffer + its length.
-// Caller frees buf when done.
-//
-// We reuse a single allocation: the input bytes are copied in,
-// then padding is written on top in place.
+// Build the padded message into a fresh buf (input bytes copied in,
+// then padding written on top).
 build_padded is {
   src buf len i64 -> ret buf {
     let total = padded_len(len)
@@ -349,20 +297,13 @@ hash_blocks is {
   }
 }
 
-// ── zero-alloc variants (#156 followup) ──────────────────────
-//
-// PBKDF2 calls HMAC (→ sha256) thousands of times in a tight
-// self-loop.  Each plain `sha256` call allocates h/padded/k_tbl/w/st,
-// and sync ret-machines inherit the caller's arena with no per-call
-// reclaim — so the arena exhausts after ~50-100 iterations and the
-// accumulator corrupts (#156).  The `_into` chain below allocates
-// NOTHING: every scratch buffer is supplied by the caller and reused
-// across iterations.  `w`, `st`, `padded` are over-sized once by the
-// top-level caller and threaded down.
-//
-// `zero_range(b, i, end)` — write 0x00 to b[i..end].  Reused scratch
-// is not mmap-zeroed like a fresh rt_allocate page, so the padding
-// gap must be cleared explicitly.
+// ── zero-alloc variants (#156) ───────────────────────────────
+// The `_into` chain allocates nothing — all scratch (w/st/padded) is
+// caller-supplied and reused, so PBKDF2's tight HMAC loop doesn't
+// exhaust the actor arena.  See docs/state/features (#156).
+
+// `zero_range(b i end)` — write 0x00 to b[i..end].  Reused scratch
+// isn't mmap-zeroed, so the padding gap must be cleared explicitly.
 zero_range is {
   b buf i i64 end i64 -> ret i64 {
     when i >= end {
